@@ -1,0 +1,5 @@
+# 推荐：微信4.x本地消息监听（Windows 10/11，Python 3.9+）
+wechatauto-replica==1.2.4.4
+
+# 旧WCF兼容方式，仅在已有对应采集环境时使用。
+wcferry==39.5.2.0

@@ -1,0 +1,59 @@
+# ===== Python 虚拟环境 =====
+.venv/
+venv/
+env/
+
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# ===== 用户真实数据 =====
+data/
+backups/
+wechatauto_logs/
+
+# ===== 数据库与日志 =====
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+
+# ===== API 密钥及敏感配置 =====
+.env
+.env.*
+*.key
+*.pem
+credentials.py
+secrets.py
+
+# ===== 打包生成文件 =====
+build/
+build*/
+dist/
+dist*/
+*.spec
+
+# ===== 开发工具配置 =====
+.idea/
+.vscode/
+
+# ===== 临时文件 =====
+*.tmp
+*.bak
+*.backup
+*.swp
+*.swo
+
+# ===== 表格与真实数据样本（待脱敏） =====
+*.xlsx
+*.xls
+*.csv
+
+# ===== Windows 本机脚本（审核后再公开） =====
+*.cmd
+*.bat
