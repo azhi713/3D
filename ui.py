@@ -595,7 +595,9 @@ class RiskApp(tk.Tk):
         selection = self.records_tree.selection()
         self.records_tree.delete(*self.records_tree.get_children())
         for record in records:
-            amount = money(sum(cents(b.principal) for b in record.bets)) if record.status == '已识别' else '—'
+            has_partial = bool(record.bets and record.pending_fragments)
+            amount = (money(sum(cents(b.principal) for b in record.bets)) +
+                      ('（部分）' if has_partial else '')) if record.status == '已识别' or has_partial else '—'
             self.records_tree.insert('', 'end', iid=record.record_id, values=(record.created_at[11:19], record.source, record.raw_text, amount, record.status), tags=() if record.status == '已识别' else ('pending',))
         keep = [iid for iid in selection if self.records_tree.exists(iid)]
         if keep:
@@ -619,7 +621,7 @@ class RiskApp(tk.Tk):
             self.plan_note.configure(text=note)
             warnings = []
             if self.snapshot.pending:
-                warnings.append(f'有{self.snapshot.pending}条待确认，尚未计入风险；当前结果不完整。')
+                warnings.append(f'有{self.snapshot.pending}条待处理；已验证的部分投注已计入，未解决片段尚未计入，当前结果不完整。')
             if self.snapshot.unconfirmed_receipts:
                 warnings.append(f'{self.snapshot.unconfirmed_receipts}条未填实收，暂按应收计入收入。')
             if self.store.import_errors:
@@ -819,6 +821,9 @@ class RiskApp(tk.Tk):
         text = tk.Text(win, wrap='word', padx=16, pady=16)
         text.pack(fill='both', expand=True)
         lines = [f'{record.lottery} / {record.period} / {record.status}', f'来源：{record.source}  发送人：{record.sender or "未登记"}', f'收到时间：{record.created_at}', '\n原文：'+record.raw_text, '\n说明：'+record.note]
+        if record.pending_fragments:
+            lines.append('\n未解决片段（不计金额）：')
+            lines.extend(f"[{item['start']}:{item['end']}] {item['text']}：{item['reason']}" for item in record.pending_fragments)
         if record.ai_candidate:
             lines.append('\nAI转换：'+record.ai_candidate)
         lines.append('\n逐笔明细：')
@@ -983,7 +988,7 @@ class RiskApp(tk.Tk):
     def queue_ai(self, record, force=False):
         if record:
             record = self.store.get(record.record_id)
-        if not record or record.status != '待确认' or record.record_id in self.ai_busy:
+        if not record or record.status not in ('待确认', '部分识别') or record.record_id in self.ai_busy:
             return
         if not self.ai_key or not self.controller.settings['ai'].get('model'):
             if force:
@@ -992,6 +997,8 @@ class RiskApp(tk.Tk):
         if not force and not self.controller.settings['ai'].get('enabled'):
             return
         revision = record.revision
+        ai_text = ('\n'.join(item['text'] for item in record.pending_fragments)
+                   if record.pending_fragments and record.bets else record.raw_text)
         record.status = 'AI识别中'
         record.note = '正在转换，原文已保存；其他投注继续计算'
         self.store.update(record, '提交AI转换')
@@ -1001,12 +1008,12 @@ class RiskApp(tk.Tk):
         service = self.ai
         def task():
             try:
-                candidate, reason = service.parse_unknown(record.lottery, record.raw_text)
+                candidate, reason = service.parse_unknown(record.lottery, ai_text)
                 self.events.put(('ai', record.record_id, revision, candidate, reason))
             except AIError as exc:
                 self.events.put(('ai_error', record.record_id, revision, str(exc)))
             except Exception as exc:
-                safe = _redact(str(exc), self.ai_key, [{'role':'user','content':record.raw_text}])
+                safe = _redact(str(exc), self.ai_key, [{'role':'user','content':ai_text}])
                 self.events.put(('ai_error', record.record_id, revision, 'AI执行失败（'+type(exc).__name__+'）：'+safe+'；原始数据已保存'))
         self.pool.submit(task)
         self.refresh()
@@ -1054,8 +1061,8 @@ class RiskApp(tk.Tk):
                     if not self.controller.settings['ai'].get('enabled'):
                         record = self.store.get(record_id)
                         if record and record.revision == revision and record.status == 'AI识别中':
-                            record.status='待确认'
-                            record.note='AI识别已关闭，原文保留待确认'
+                            record.status='部分识别' if record.pending_fragments and record.bets else '待确认'
+                            record.note='AI识别已关闭，未解决片段保留待确认'
                             self.store.update(record,'关闭AI后保留原文')
                         dirty=True
                         continue
@@ -1074,8 +1081,8 @@ class RiskApp(tk.Tk):
                     self._manual_ai.discard(record_id)
                     record = self.store.get(record_id)
                     if record and record.revision == revision and record.status in ('待确认', 'AI识别中'):
-                        record.status = '待确认'
-                        record.note = reason
+                        record.status = '部分识别' if record.pending_fragments and record.bets else '待确认'
+                        record.note = reason + ('；本地已识别部分仍保留' if record.bets else '')
                         self.store.update(record, 'AI失败保留原文')
                         if hasattr(self, 'add_feedback'):
                             self.add_feedback.configure(text='AI识别失败：'+reason[:210], foreground=RED)
