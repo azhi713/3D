@@ -78,7 +78,7 @@ class Controller:
                             record.note += f'；自报{record.claimed_amount:g}元，差额{(total-cents(record.claimed_amount))/100:g}元'
                         record.revision += 1
                         store.update(record, '修正复试/定位本金：按最新规则')
-                elif record.status in ('待确认', 'AI待确认', 'AI待识别', 'AI识别中'):
+                elif record.status in ('待确认', '部分识别', 'AI待确认', 'AI待识别', 'AI识别中'):
                     before = record.to_dict()
                     self.parse_record(record)
                     if record.to_dict() != before:
@@ -143,33 +143,56 @@ class Controller:
         text = self.settings.get('aliases', {}).get(record.raw_text.strip(), record.raw_text)
         bets, normalized, reason = parser.parse(record.lottery, text)
         claimed = parser.last_claimed
+        pending = []
+        if not bets:
+            # 整条无法识别时，只抢救独立、明确且已通过本地校验的子项。
+            partial, pending, normalized = parser.parse_partial(record.lottery, text)
+            if partial:
+                bets = partial
+                claimed = None  # 未完成订单的收款合计绝不可分摊到已确认子项。
         used_ai = False
-        if not bets and record.ai_candidate:
-            original_reason = reason
-            candidate_bets, candidate_normalized, ai_error = parser.parse(record.lottery, record.ai_candidate)
-            if claimed is None:
-                claimed = parser.last_claimed
-            if candidate_bets and self.ai_blocked(original_reason) and not allow_conflict:
-                # AI可以尝试识别有歧义的消息，但不能自动覆盖原文的明确冲突。
-                record.bets = []
-                record.normalized_text = candidate_normalized
+        review_note = ''
+        if record.ai_candidate and (pending or not bets):
+            # AI仅给候选；在本地校验完成前不生成正式投注。
+            probe = BetParser(parser.rules, parser.policy)
+            ai_bets, candidate_normalized, ai_error = probe.parse(record.lottery, record.ai_candidate)
+            if ai_bets and (self.ai_blocked(reason) or (bets and pending)) and not allow_conflict:
+                # 部分已识别的订单需要人工确认AI候选，防止重复加入或捏造号码。
+                record.bets = bets
+                record.pending_fragments = pending
+                record.normalized_text = normalized
                 record.claimed_amount = claimed
                 record.status = 'AI待确认'
-                record.note = '原文需人工核对：' + original_reason + '；AI建议已保存，点击查看原文确认'
+                record.note = ('本地已确认%d笔，待人工确认AI候选；' % len(bets)) + reason
                 return
-            bets, normalized = candidate_bets, candidate_normalized
-            reason = ('AI转换未通过校验：'+ai_error) if ai_error else ''
-            used_ai = bool(bets)
+            if ai_bets:
+                bets = bets + ai_bets
+                pending = []
+                normalized = candidate_normalized if not bets[:-len(ai_bets)] else normalized
+                reason = ''
+                used_ai = True
+            else:
+                review_note = '；AI转换未通过本地校验：' + ai_error
         record.bets = bets
+        record.pending_fragments = pending
         record.normalized_text = normalized
         record.claimed_amount = claimed
-        record.status = '已识别' if bets else '待确认'
-        record.note = reason or f'共{len(bets)}笔，应收{money(sum(cents(b.principal) for b in bets))}元'
+        if bets and pending:
+            record.status = '部分识别'
+            due = sum(cents(b.principal) for b in bets)
+            record.note = (f'本地已识别{len(bets)}笔、暂计{money(due)}元；'
+                           f'另有{len(pending)}段待审核，金额未计入；' +
+                           '；'.join(item['text'][:60] for item in pending))
+        else:
+            record.status = '已识别' if bets else '待确认'
+            record.note = reason or f'共{len(bets)}笔，应收{money(sum(cents(b.principal) for b in bets))}元'
+        if review_note:
+            record.note += review_note
         if bets and getattr(parser, 'last_warnings', None):
             record.note += '；' + '；'.join(parser.last_warnings)
         if used_ai:
-            record.note += '；AI转换已通过程序校验，自动计入'
-        if record.claimed_amount is not None and bets:
+            record.note += '；AI转换已通过程序校验，自动计入' if not allow_conflict else '；AI候选经人工确认并通过本地校验'
+        if record.claimed_amount is not None and bets and not pending:
             due = sum(cents(b.principal) for b in bets)
             if cents(record.claimed_amount) != due:
                 record.note += f'；自报{record.claimed_amount:g}元，差额{(due-cents(record.claimed_amount))/100:g}元'
@@ -259,8 +282,13 @@ class Controller:
     def analysis(self, lottery):
         records = [r for r in self.records() if r.lottery == lottery]
         valid = [r for r in records if r.status == '已识别']
-        bets = [b for r in valid for b in r.bets]
-        revenue = sum(cents(r.received_amount) if r.received_amount is not None else sum(cents(b.principal) for b in r.bets) for r in valid)
+        # 只把逐笔本地验证通过的子项计入，未识别片段和整条实收都不混入。
+        partial = [r for r in records if r.status in ('部分识别', 'AI识别中', 'AI待确认')
+                   and r.pending_fragments and r.bets]
+        bets = [b for r in valid + partial for b in r.bets]
+        revenue = (sum(cents(r.received_amount) if r.received_amount is not None else
+                       sum(cents(b.principal) for b in r.bets) for r in valid)
+                   + sum(cents(b.principal) for r in partial for b in r.bets))
         principal, risks, payouts = self.engine.calculate(
             lottery, bets, self.settings['risk_threshold'], self.settings['external_direct_prize'][lottery],
             revenue/100, self.settings['threshold_metric'], self.settings['include_hedge_cost'],
@@ -309,7 +337,10 @@ class Controller:
     def explain(self, lottery, number):
         result = []
         for record in self.records():
-            if record.lottery != lottery or record.status != '已识别':
+            if record.lottery != lottery or not (
+                    record.status == '已识别' or
+                    (record.status in ('部分识别', 'AI识别中', 'AI待确认')
+                     and record.pending_fragments and record.bets)):
                 continue
             for bet in record.bets:
                 payout = self.engine.payout_for(lottery, bet, number)

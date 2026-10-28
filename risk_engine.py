@@ -23,7 +23,9 @@ def winning_indices(play, selection, span0_wins):
         elif play == '独胆':
             win = selection in result
         elif play == '双飞':
-            win = set(selection).issubset(unique)
+            # 双飞相同数字必须在开奖号码中出现至少两次；豹子按现有规则另行排除。
+            win = (result.count(selection[0]) >= 2 if selection[0] == selection[1]
+                   else set(selection).issubset(unique))
         elif play == '对子':
             win = result.count(selection[0]) == 2
         elif play == '豹子':

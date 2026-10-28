@@ -1,11 +1,13 @@
 """先拆投注，后识别；整条必须完整识别，禁止默默漏掉未识别片段。"""
 import re
 import unicodedata
+from decimal import Decimal
+from itertools import permutations
 from math import prod
 from config import LOTTERIES, CN_NUM, RULES_BY_LOTTERY
 from models import Bet, cents
 
-MULT = r'(?:0\.5|半|[0-9]+|[零〇一二两三四五六七八九十百千万]+)'
+MULT = r'(?:半|[0-9]+(?:\.[0-9]{1,2})?|[零〇一二两三四五六七八九十百千万]+)'
 CN_MULT_START = r'[零〇一二两三四五六七八九十百千万]'
 NAMED_SIZE = r'(?:(二|三|四|五|六|七|八|九|[2-9])码)?'
 ALIASES = {
@@ -38,6 +40,10 @@ def split_lottery_message(text, default_lottery):
     raw = unicodedata.normalize('NFKC', text or '')
     if default_lottery not in LOTTERIES:
         raise ValueError('请选择福彩或体彩')
+
+    # “福体”是同一下注同时购买两种彩种，必须保留两份原文分别核算。
+    if re.match(r'^\s*(?:福体|体福)', raw):
+        return {'福彩': raw.strip(), '体彩': raw.strip()}
 
     # 大底格式的彩种写在号码块后面的汇总行，必须把“号码块+汇总行”作为整体路由。
     lines = raw.replace('\r\n', '\n').replace('\r', '\n').split('\n')
@@ -129,6 +135,21 @@ class BetParser:
                 raise ValueError('请选择福彩或体彩')
             if not isinstance(text, str) or not text.strip():
                 raise ValueError('内容为空')
+            # 交接包已确认的“福体537一单一组8”——8元是双彩总额。
+            dual = re.fullmatch(
+                r'\s*(?:福体|体福)\s*([0-9]{3})\s*一单一组\s*([0-9]+(?:\.[0-9]{1,2})?)\s*(?:元|米|块)?\s*',
+                unicodedata.normalize('NFKC', text),
+            )
+            if dual:
+                total = Decimal(dual[2])
+                multiplier = self._multiplier(str(total / 8))
+                bets = (self._from_kind(lottery, text, dual[1], '直选', multiplier)
+                        + self._from_kind(lottery, text, dual[1], '组选', multiplier))
+                self.last_claimed = float(total / 2)
+                if sum(cents(b.principal) for b in bets) != cents(total / 2):
+                    raise ValueError('福体合计与两个彩种的下注金额不一致')
+                return bets, self.normalize_text(text), ''
+
             # 支持玩法在首行、候选位置分行、最后附人工算式的下单。
             special = self._parse_position_with_receipt(lottery, text)
             if special is not None:
@@ -148,6 +169,24 @@ class BetParser:
                 if requested != lottery:
                     raise ValueError('文字彩种与所选彩种冲突，请核对')
                 line = line[prefix.end():]
+            # 不带“倍”的“一单一组8”按已确认模板的金额处理，不当作8倍。
+            shared = re.fullmatch(
+                r'([0-9]{3}(?:\s+[0-9]{3})*)\s*一单一组\s*([0-9]+(?:\.[0-9]{1,2})?)\s*(?:元|米|块)?',
+                line,
+            )
+            if shared:
+                numbers = re.findall(r'[0-9]{3}', shared[1])
+                declared = Decimal(shared[2])
+                multiple = declared / (Decimal(4) * len(numbers))
+                if multiple not in (Decimal('0.5'), Decimal('1'), Decimal('2')):
+                    raise ValueError('一单一组未写倍数，金额可能有歧义，请人工确认')
+                multiplier = self._multiplier(str(multiple))
+                bets = []
+                for number in numbers:
+                    bets.extend(self._from_kind(lottery, text, number, '直选', multiplier))
+                    bets.extend(self._from_kind(lottery, text, number, '组选', multiplier))
+                self.last_claimed = float(declared)
+                return bets, self.normalize_text(text), ''
             amount = re.search(r'(?:[， ]*(?:合计|总计|金额|共)\s*[:：]?\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元?|\s*([0-9]+(?:\.[0-9]{1,2})?)\s*元)\s*$', line)
             if amount:
                 self.last_claimed = cents(amount[1] or amount[2]) / 100
@@ -174,6 +213,50 @@ class BetParser:
             return bets, self.normalize_text(text), ''
         except (ValueError, KeyError) as exc:
             return [], self.normalize_text(text), str(exc)
+
+    def parse_partial(self, lottery, text):
+        """仅在整条解析失败后，保守保留独立、显式分隔且可完整验证的子项。
+
+        不跨段猜测玩法/倍数；带合计、定位、跨彩种等上下文的复杂消息继续整体待审。
+        返回(已验证投注, 未解决片段[原文字符位置], 规范化原文)。
+        """
+        bets, normalized, reason = self.parse(lottery, text)
+        if bets:
+            return bets, [], normalized
+        pending_whole = [{'text': text, 'start': 0, 'end': len(text), 'reason': reason}]
+        if not isinstance(text, str) or not text.strip() or lottery not in LOTTERIES:
+            return [], pending_whole, normalized
+        if re.search(r'合计|总计|金额|福家|体家|福体|体福|定位|[百十个]位?|撤单|取消|更正|修改|改成|不买|停', text):
+            return [], pending_whole, normalized
+        parts = list(re.finditer(r'[^，,;；。\r\n]+', text))
+        if len(parts) < 2:
+            return [], pending_whole, normalized
+        found, unresolved = [], []
+        for part in parts:
+            fragment = part.group().strip()
+            if not fragment:
+                continue
+            start = part.start() + len(part.group()) - len(part.group().lstrip())
+            end = part.end() - len(part.group()) + len(part.group().rstrip())
+            # 只有明确写了玩法及倍率的独立投注，才能在整条失败时先入风险。
+            has_play = re.search(r'直|单|组|复式|复试|复|独|双飞|对子|豹子|跨|全包|转圈打', fragment)
+            has_multiplier = re.search(r'倍|半|[0-9]+\s*[元米块]', fragment)
+            if not has_play or not has_multiplier:
+                unresolved.append({'text': fragment, 'start': start, 'end': end,
+                                   'reason': '缺少独立明确的玩法或倍数'})
+                continue
+            probe = BetParser(self.rules, self.policy)
+            item_bets, _, error = probe.parse(lottery, fragment)
+            if item_bets:
+                found.extend(item_bets)
+            else:
+                unresolved.append({'text': fragment, 'start': start, 'end': end,
+                                   'reason': error})
+        if not found:
+            return [], pending_whole, normalized
+        # 整条未完成时不能把子项小计当成整条实收金额。
+        self.last_claimed = None
+        return found, unresolved, normalized
 
     def _parse_position_with_receipt(self, lottery, text):
         """严格匹配“排定位 / 百069 / 十568 / 个14 / 8倍8*36=288”。
@@ -307,11 +390,16 @@ class BetParser:
 
     def _multiplier(self, value):
         value = str(value).strip()
-        if value in ('半', '0.5'):
+        if value == '半':
             return 0.5
+        if re.fullmatch(r'[0-9]+(?:\.[0-9]{1,2})?', value):
+            number = Decimal(value)
+            if not 0 < number <= 1000000:
+                raise ValueError('倍数须大于0且不超过1000000')
+            return int(number) if number == int(number) else float(number)
         result = chinese_int(value)
         if not 1 <= result <= 1000000:
-            raise ValueError('倍数须为半倍或1～1000000的整数')
+            raise ValueError('倍数须大于0且不超过1000000')
         return result
 
     def _make(self, lottery, raw, play, selection, mult):
@@ -327,13 +415,19 @@ class BetParser:
         else:
             # 复试与其它玩法一样，严格使用《明细规则2.xlsx》的固定单倍本金。
             cost = cents(rule['principal'])
-        return Bet(play, selection, mult, cost * mult / 100, raw)
+        principal = Decimal(cost) * Decimal(str(mult)) / 100
+        return Bet(play, selection, mult, float(principal), raw)
 
     @staticmethod
     def validate(play, selection, mult):
-        valid_mult = (mult == 0.5) or (type(mult) is int and 1 <= mult <= 1000000)
-        if not valid_mult:
-            raise ValueError('倍数必须为半倍或正整数')
+        # 明确小数倍按金额精确核算；奖金小数倍的最终派奖边界另行确认。
+        try:
+            number = Decimal(str(mult))
+        except Exception:
+            raise ValueError('倍数必须为正数，最多两位小数') from None
+        if (type(mult) is bool or not number.is_finite() or
+                number <= 0 or number > 1000000 or number.as_tuple().exponent < -2):
+            raise ValueError('倍数必须为正数，最多两位小数')
         if play.endswith('码定位'):
             items = selection.split('|')
             parts = [item.split(':') for item in items]
@@ -360,7 +454,7 @@ class BetParser:
         elif play == '独胆':
             valid = len(selection) == 1
         elif play == '双飞':
-            valid = len(selection) == 2 and len(set(selection)) == 2
+            valid = len(selection) == 2  # 交接包确认：44、88双飞也是有效投注
         elif play == '对子':
             valid = len(selection) == 2 and len(set(selection)) == 1
         else:
@@ -405,6 +499,22 @@ class BetParser:
             multiplier = self._multiplier(m[2] or '1')
             return [self._make(lottery, raw, '直选', number, multiplier)
                     for number in re.findall(r'[0-9]{3}', m[1])]
+
+
+        # 转圈打按具体直选号码展开；单次投注内部排列去重，跨原始输入不去重。
+        round_bet = re.fullmatch(
+            r'([0-9]{3}(?:\s*[ /、]\s*[0-9]{3})*)\s*转圈打\s*(?:各\s*)?(?:x\s*)?('+MULT+r')\s*倍?',
+            line,
+        )
+        if round_bet:
+            multiplier = self._multiplier(round_bet[2])
+            out = []
+            for number in re.split(r'\s*[ /、]\s*', round_bet[1]):
+                if len(set(number)) == 1:
+                    raise ValueError('豹子不能转圈打，请人工核对')
+                for direct in sorted({''.join(digits) for digits in permutations(number)}):
+                    out.append(self._make(lottery, raw, '直选', direct, multiplier))
+            return out
 
         # 全包关键词前后都合法，包全／全、组3／组6也映射同一玩法。
         groups = r'组[三六36](?:\s*组[三六36])?'

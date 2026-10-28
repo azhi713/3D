@@ -28,7 +28,7 @@ def money(value):
 class Bet:
     play: str
     selection: str
-    multiplier: int
+    multiplier: int | float
     principal: float
     raw: str = ''
 
@@ -59,6 +59,7 @@ class MessageRecord:
     claimed_amount: float | None = None
     revision: int = 0
     ai_candidate: str = ''
+    pending_fragments: list = field(default_factory=list)  # 原文位置与未识别原因，仅供AI/人工处理
 
     def to_dict(self):
         obj = asdict(self)
