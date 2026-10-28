@@ -10,7 +10,7 @@ from pathlib import Path
 
 from config import RULES_BY_LOTTERY, CN_NUM
 from models import cents, MessageRecord, RiskRow
-from parser import BetParser, chinese_int
+from parser import BetParser, chinese_int, split_lottery_message
 from risk_engine import RiskEngine, plan_text
 from data_store import DataStore
 from controller import Controller
@@ -30,6 +30,47 @@ class ParserTests(unittest.TestCase):
         bets = self.parse('福293一单一组50倍，095组505组三一倍')
         self.assertEqual([(b.play,b.selection,b.multiplier,b.principal) for b in bets],
                          [('直选','293',50,100),('组六（组选）','293',50,100),('三码组三','095',1,10),('组三（组选）','505',1,2)])
+
+    def test_local_confirmed_rules_round_fly_and_decimal(self):
+        for lottery in ('福彩', '体彩'):
+            with self.subTest(lottery=lottery):
+                self.assertEqual(self.parse('293单1.5倍', lottery)[0].principal, 3)
+                self.assertEqual(self.parse('293单0.5倍', lottery)[0].principal, 1)
+                self.assertEqual(self.parse('44双飞1倍', lottery)[0].principal, 10)
+                self.assertEqual(self.parse('459组三5倍', lottery)[0].principal, 50)
+                round_bets = self.parse('559转圈打1倍', lottery)
+                self.assertEqual([b.selection for b in round_bets], ['559', '595', '955'])
+                self.assertEqual(sum(b.principal for b in round_bets), 6)
+                self.assertEqual(len(self.parse('559、599转圈打1倍', lottery)), 6)
+                self.assertEqual(len(self.parse('023转圈打1倍', lottery)), 6)
+                self.assertEqual(sum(b.principal for b in self.parse('023转圈打1倍', lottery)), 12)
+                self.assertFalse(self.parser.parse(lottery, '555转圈打1倍')[0])
+
+    def test_dual_lottery_and_shared_amount_templates(self):
+        for lottery in ('福彩', '体彩'):
+            bets = self.parse('福体537一单一组8', lottery)
+            self.assertEqual(len(bets), 2)
+            self.assertEqual(sum(b.principal for b in bets), 4)
+            self.assertEqual(self.parser.last_claimed, 4)
+        sections = split_lottery_message('福体537一单一组8', '福彩')
+        self.assertEqual(set(sections), {'福彩', '体彩'})
+        self.assertEqual(sections['福彩'], '福体537一单一组8')
+        bets = self.parse('福492 496一单一组8')
+        self.assertEqual(len(bets), 4)
+        self.assertEqual(sum(b.principal for b in bets), 8)
+        self.assertEqual(self.parser.last_claimed, 8)
+        self.assertFalse(self.parser.parse('福彩', '福体537一单一组7')[0])
+
+    def test_partial_local_recognition_only_safe_delimited_items(self):
+        bets, pending, _ = self.parser.parse_partial('福彩', '293单1倍，未知口语，505组1倍')
+        self.assertEqual([b.selection for b in bets], ['293', '505'])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['text'], '未知口语')
+        self.assertEqual(pending[0]['start'], 7)
+        self.assertEqual(self.parser.parse('福彩','293单1倍，未知口语，505组1倍')[0], [])
+        for unsafe in ('293单1倍，撤单', '293单1倍，合计2元，其他', '293单1倍，百8定位2倍，未知'):
+            with self.subTest(unsafe=unsafe):
+                self.assertEqual(self.parser.parse_partial('福彩', unsafe)[0], [])
 
     def test_multiple_bets_without_comma(self):
         bets = self.parse('293单50倍505组1倍0257组六10倍')
@@ -58,7 +99,7 @@ class ParserTests(unittest.TestCase):
                     self.assertEqual(bets[0].play,play)
 
     def test_fail_closed_no_silent_partial_or_invented_bet(self):
-        cases = ['293单0倍','293单-1倍','293单1.5倍','293单','293 50倍','293单50倍，随便再来一点',
+        cases = ['293单0倍','293单-1倍','293单','293单50倍，随便再来一点',
                  '358421组10倍','555组三1倍','0123456789组六1倍','全包组六0倍','foo293单50倍',
                  '293单50倍取消','百8百9定位1倍','百99定位2倍','27双飞2倍多一单', '293组1000001倍']
         for sample in cases:
@@ -139,13 +180,14 @@ class ParserTests(unittest.TestCase):
     def test_ambiguous_policies_hold_only_affected(self):
         parser = BetParser()
         self.assertTrue(parser.parse('福彩','百8定位1倍')[0])
-        self.assertFalse(parser.parse('福彩','百069十568个14定位8倍')[0])
+        self.assertTrue(parser.parse('福彩','百069十568个14定位8倍')[0])
         self.assertTrue(parser.parse('福彩','跨度0 2倍')[0])
         self.assertTrue(parser.parse('福彩','跨度1 2倍')[0])
         bets = self.parse('百069十568个14定位8倍')
-        self.assertEqual(bets[0].principal,1440)
+        self.assertEqual(bets[0].principal,288)
         whole = BetParser(policy={'position_cost':'whole','span0_wins':True})
-        self.assertEqual(whole.parse('福彩','百069十568个14定位8倍')[0][0].principal,80)
+        # 新版三位定位按展开组合×2元，不再采用旧的固定整注算法。
+        self.assertEqual(whole.parse('福彩','百069十568个14定位8倍')[0][0].principal,288)
 
 
 class RiskTests(unittest.TestCase):
@@ -164,29 +206,28 @@ class RiskTests(unittest.TestCase):
         self.assertTrue(all(payouts[n] == 750 for n in expected))
         self.assertEqual(payouts['355'],0)
 
-    def test_fushi_all_sizes_exclude_pairs_and_triples(self):
+    def test_fushi_all_sizes_follow_private_fixed_pricing_and_cover_pairs(self):
         for size in range(3,10):
             bet = self.parse('012345678'[:size]+'复式2倍')[0]
-            self.assertEqual(bet.principal,size*(size-1)*(size-2)*2*2)
+            self.assertEqual(bet.principal,20)
             _,_,payouts = self.engine.calculate('福彩',[bet],1,1800)
-            self.assertEqual(sum(bool(v) for v in payouts.values()), size*(size-1)*(size-2))
-            self.assertEqual(payouts['012'],3600)
+            covered = size*(size-1)*(size-2) + size*(size-1)*3
+            self.assertEqual(sum(bool(v) for v in payouts.values()), covered)
+            self.assertEqual(payouts['012'],RULES_BY_LOTTERY['福彩'][bet.play]['prize']*2)
             self.assertEqual(payouts['000'],0)
-            self.assertEqual(payouts['001'],0)
+            self.assertEqual(payouts['001'],RULES_BY_LOTTERY['福彩'][bet.play]['prize']*2)
 
-    def test_user_5781_fushi_cost_and_exact_24_outcomes(self):
-        expected = {''.join(result) for result in itertools.permutations('5781',3)}
+    def test_user_5781_fushi_fixed_cost_and_60_outcomes(self):
         for lottery in ('福彩','体彩'):
             for alias in ('复试','复式'):
                 bet = self.parse('5781'+alias+'一倍', lottery)[0]
-                self.assertEqual(bet.principal,48)
+                self.assertEqual(bet.principal,10)
                 _,_,payouts = self.engine.calculate(lottery,[bet],1,1800)
-                self.assertEqual({number for number,payout in payouts.items() if payout}, expected)
-                self.assertEqual(len(expected),24)
-                self.assertEqual(payouts['578'],1800)
-                self.assertEqual(payouts['551'],0)
+                self.assertEqual(sum(bool(v) for v in payouts.values()),60)
+                self.assertEqual(payouts['578'],140)
+                self.assertEqual(payouts['551'],140)
                 self.assertEqual(payouts['777'],0)
-        self.assertEqual(self.parse('5781复试10倍')[0].principal,480)
+        self.assertEqual(self.parse('5781复试10倍')[0].principal,100)
 
     def test_position_requires_all(self):
         bet = self.parse('百069十568个14定位8倍')[0]
@@ -250,6 +291,13 @@ class RiskTests(unittest.TestCase):
         self.assertEqual((row.number,row.net_loss,row.plan_multiplier),('352',18000,10))
         row = RiskEngine(rules).calculate('福彩',self.parse('352单1倍'),5000,1800,revenue=1999.99)[1][0]
         self.assertEqual(row.plan_multiplier,11)
+
+    def test_repeated_digit_double_fly_requires_two_copies(self):
+        bet = self.parse('44双飞1倍')[0]
+        self.assertEqual(self.engine.payout_for('福彩', bet, '144'), 160)
+        self.assertEqual(self.engine.payout_for('福彩', bet, '414'), 160)
+        self.assertEqual(self.engine.payout_for('福彩', bet, '123'), 0)
+        self.assertEqual(self.engine.payout_for('福彩', bet, '444'), 0)
 
     def test_separate_rules_and_money(self):
         rules = deepcopy(RULES_BY_LOTTERY)
@@ -344,7 +392,34 @@ class StorageTests(unittest.TestCase):
         self.assertIn('差额',a.note)
         self.controller.edit(a,a.raw_text,0)
         analysis = self.controller.analysis('福彩')
-        self.assertEqual((analysis.principal,analysis.revenue,analysis.pending),(600,0,1))
+        # 仅已验证的子项计入，未知片段与整条实收仍保持待处理。
+        self.assertEqual((analysis.principal,analysis.revenue,analysis.pending),(10600,10000,1))
+
+    def test_dual_lottery_record_count_and_amount(self):
+        record = self.controller.add('福彩','福体537一单一组8')
+        self.assertIsNotNone(record)
+        self.assertEqual(len(self.controller.last_added_records), 2)
+        self.assertEqual({r.lottery for r in self.controller.last_added_records}, {'福彩', '体彩'})
+        for lottery in ('福彩','体彩'):
+            snapshot = self.controller.analysis(lottery)
+            self.assertEqual((snapshot.principal, snapshot.revenue, snapshot.pending), (400,400,0))
+        self.assertTrue(all(r.raw_text == '福体537一单一组8' for r in self.controller.last_added_records))
+
+    def test_partial_local_bets_are_safe_and_ai_only_covers_pending(self):
+        record = self.controller.add('福彩', '293单1倍，口语不明，505组1倍')
+        self.assertEqual(record.status, '部分识别')
+        self.assertEqual([b.selection for b in record.bets], ['293', '505'])
+        self.assertEqual([x['text'] for x in record.pending_fragments], ['口语不明'])
+        snapshot = self.controller.analysis('福彩')
+        self.assertEqual((snapshot.principal, snapshot.revenue, snapshot.pending), (400, 400, 1))
+        # 不能因为AI给了可解析的新号码就自动合并：需人工审查候选。
+        self.assertFalse(self.controller.apply_ai_candidate(record.record_id, record.revision, '123单1倍'))
+        record = self.store.get(record.record_id)
+        self.assertEqual(record.status, 'AI待确认')
+        self.assertEqual(self.controller.analysis('福彩').principal, 400)
+        self.controller.accept_ai(record)
+        self.assertEqual(self.controller.analysis('福彩').principal, 600)
+        self.assertEqual(self.store.get(record.record_id).status, '已识别')
 
     def test_deleted_ai_results_and_revision_are_rejected(self):
         record = self.controller.add('福彩','123来一单')
