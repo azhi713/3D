@@ -68,6 +68,7 @@ class WorkspaceRedesignTests(unittest.TestCase):
         self.assertLessEqual(width, 1040)
         self.app.deiconify()
         self.app.geometry(f'{width}x{height}')
+        self.app.update()
         self.app.update_idletasks()
         for idx in range(3):
             self.app.workspace_tabs.select(idx)

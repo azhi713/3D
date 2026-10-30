@@ -145,7 +145,8 @@ class AIService:
         timeout = effective_timeout(self.config)
         rid = datetime.now().strftime('%H%M%S%f') + '-' + str(threading.get_ident())
         self.connected = False
-        metrics={'response_s':0.0,'json_s':0.0,'request_build_s':0.0}
+        metrics={'response_s':0.0,'json_s':0.0,'request_build_s':0.0,'headers_s':None,'first_byte_s':None,'body_read_s':None,
+                 'transport_stage':'build','billing_state':'not_sent'}
         self._timing_local.metrics=metrics
         try:
             request = self._build_request(messages)
@@ -158,15 +159,24 @@ class AIService:
                       endpoint=_redact(endpoint, self.api_key, messages), mode='completions' if legacy else 'chat',
                       timeout_s=timeout, request_bytes=len(request.data or b''))
             response_started=time.perf_counter()
+            metrics['transport_stage']='connect_or_wait_headers'
+            metrics['billing_state']='unknown_after_send'
             with urllib.request.urlopen(request, timeout=timeout) as response:
+                metrics['headers_s']=time.perf_counter()-response_started
+                metrics['transport_stage']='read_body'
                 self._log('收到响应头', request_id=rid, http_status=response.status,
                           elapsed_s=round(time.perf_counter()-started,3))
-                raw = response.read(_MAX_REPLY+1)
+                body_started=time.perf_counter()
+                first=response.read(1)
+                metrics['first_byte_s']=time.perf_counter()-response_started
+                raw=first+response.read(_MAX_REPLY+1-len(first))
+                metrics['body_read_s']=time.perf_counter()-body_started
             metrics['response_s']=time.perf_counter()-response_started
             self._log('收到完整响应', request_id=rid, elapsed_s=round(time.perf_counter()-started,3), response_bytes=len(raw))
             if len(raw)>_MAX_REPLY:
                 raise AIError('AI返回内容超过1MB，原始数据已保存')
             json_started=time.perf_counter()
+            metrics['transport_stage']='json'
             try:
                 obj = json.loads(raw)
                 content = obj['choices'][0]['text'] if legacy else obj['choices'][0]['message']['content']
@@ -180,6 +190,8 @@ class AIService:
             except (ValueError, KeyError, TypeError, IndexError) as err:
                 raise AIError('AI返回格式错误：'+type(err).__name__+'；未能解析为程序需要的JSON对象，原始数据已保存') from None
             self.connected = True
+            metrics['transport_stage']='complete'
+            metrics['billing_state']='response_received'
             metrics['json_s']=time.perf_counter()-json_started
             self._log('JSON解析成功', request_id=rid, elapsed_s=round(time.perf_counter()-started,3), result_field_count=len(answer))
             return answer
@@ -195,9 +207,11 @@ class AIService:
             cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
             is_timeout = isinstance(cause, (TimeoutError, socket.timeout)) or ('timed out' in str(cause).lower())
             kind = '响应超时' if is_timeout else '网络连接失败'
+            metrics['timeout_stage']=metrics['transport_stage'] if is_timeout else None
             detail = _redact(str(cause), self.api_key, messages)[:200]
             self._log('网络失败', request_id=rid, error_type=type(cause).__name__,
-                      elapsed_s=round(time.perf_counter()-started,3), configured_timeout_s=timeout, error=detail)
+                      elapsed_s=round(time.perf_counter()-started,3), configured_timeout_s=timeout,
+                      transport_stage=metrics['transport_stage'],billing_state=metrics['billing_state'],error=detail)
             raise AIError(f'AI{kind}（请求超时设置{timeout}秒）；{type(cause).__name__}: {detail}；原始数据已保存' +
                           ('；可能已经产生模型费用，请勿立即重复提交' if is_timeout else '')) from None
         except AIError as exc:
@@ -215,8 +229,18 @@ class AIService:
     def parse_unknown(self, lottery, text):
         if len(text) > 10000:
             raise AIError('文字过长，请分批添加')
+        request_data={'lottery':lottery,'raw_text':text}
+        if text.lstrip().startswith('{'):
+            try:
+                context=json.loads(text)
+                if isinstance(context,dict) and isinstance(context.get('raw_text'),str):
+                    request_data=context
+            except ValueError:
+                pass
         obj = self._request([{'role': 'system', 'content': (self.config.get('prompt') or DEFAULT_AI_PROMPT).strip()},
-                             {'role': 'user', 'content': json.dumps({'lottery': lottery, 'raw_text': text}, ensure_ascii=False)}])
+                             {'role': 'user', 'content': json.dumps(request_data, ensure_ascii=False)}])
+        if isinstance(obj.get('candidate_bets'),list) and obj['candidate_bets']:
+            return json.dumps(obj,ensure_ascii=False),str(obj.get('brief_reason',''))[:200]
         if obj.get('uncertain') is not False or not isinstance(obj.get('standard_text'), str) or not obj['standard_text'].strip():
             reason = _redact(str(obj.get('reason', '需要人工确认')), self.api_key,
                              [{'role':'user','content':json.dumps({'raw_text':text},ensure_ascii=False)}])[:200]

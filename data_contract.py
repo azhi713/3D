@@ -27,6 +27,8 @@ def play_code(play):
         return 'SPAN'
     if play.startswith('和值'):
         return 'SUM'
+    if play.startswith('1胆'):
+        return 'DANTUO_GROUP3' if play.endswith('组3') else 'DANTUO_GROUP6'
     return 'UNKNOWN'
 
 
@@ -44,6 +46,8 @@ def record_to_contract(record):
             'ticket_codes':[bet.selection] if ticket else [],
             'digit_sets':list(bet.selection) if is_pool else [],
             'position_sets':positions,
+            'dan':bet.selection.split(':')[0] if bet.play.startswith('1胆') else None,
+            'tuo':bet.selection.split(':')[1] if bet.play.startswith('1胆') else None,
             'original_selection':bet.selection,
             'bet_multiples':str(bet.multiplier),
             'unit_price_yuan':None if bet.unit_price_yuan is None else str(bet.unit_price_yuan),
@@ -52,6 +56,7 @@ def record_to_contract(record):
             'source_span':bet.source_span,
             'parse_source':bet.parse_source,
             'rules_version':bet.rules_version,
+            'settlement_rule_pending':list(bet.settlement_rule_pending),
         })
     return {
         'schema_version':SCHEMA_VERSION,
@@ -73,6 +78,7 @@ def record_to_contract(record):
             'declared_total_yuan':record.declared_total_yuan,
             'parse_status':record.parse_status,
             'review_status':record.review_status,
+        'ai_request_state':record.ai_request_state,
             'issues':record.issues,
             'unresolved_fragments':record.pending_fragments,
         }],

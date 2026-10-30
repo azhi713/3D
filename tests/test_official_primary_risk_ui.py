@@ -89,7 +89,7 @@ class RiskUITests(unittest.TestCase):
         self.assertEqual(self.app.risks_tree.item('438','values')[1],'18,000')
         self.assertEqual(self.app.risks_tree.item('438','values')[2],'17,980')
         self.assertEqual(len(self.app.source_rows.get_children()),1)
-        self.assertIn('10',self.app.source_rows.item('0','values')[2])
+        self.assertIn('10',self.app.source_rows.item(self.app.source_rows.get_children()[0],'values')[2])
         self.assertIn('438',self.app.sources.get('1.0','end'))
         self.app.sort_risks('plan')
         self.assertIn('438',self.app.risks_tree.get_children())

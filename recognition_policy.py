@@ -22,8 +22,12 @@ def classify_fragment(text,reason=''):
         return {'code':'rule_violation','ai_eligible':False,'reason':reason or '非法号码或倍数'}
     if re.search(r'尚未确认|码数与|彩种.*冲突|同一位置写了多次|需确认下注口径',reason or ''):
         return {'code':'unconfirmed_rule','ai_eligible':False,'reason':reason}
-    if re.search(r'胆拖|胆.*拖|拖.*胆',line):
-        return {'code':'unconfirmed_rule','ai_eligible':False,'reason':'未找到已确认的胆拖收费、奖金与重复命中规则'}
+    if re.search(r'金额与倍数均可解释|金额/倍数解释不能由|金额/倍率存在歧义',reason or ''):
+        return {'code':'insufficient_context','ai_eligible':False,'reason':reason}
+    if re.search(r'大小单双|大小单双|买大|买小|买奇|买偶',line):
+        return {'code':'unconfirmed_rule','ai_eligible':False,'reason':'未提供该玩法的收费及奖金依据'}
+    if re.search(r'(?:和值|合值|和直)\s*(?:2[89]|[3-9]\d|\d{3,})',line) or re.search(r'\d{2,}\s*胆|胆\s*\d{2,}',line):
+        return {'code':'rule_violation','ai_eligible':False,'reason':'和值超出0至27或不是单胆规则'}
     if re.search(r'怎么算|多少钱|多少倍|怎么下|是什么意思|中.*的话|中奖.*多少',line):
         return {'code':'non_bet','ai_eligible':False,'reason':'规则/金额询问，不自动作为新投注发送AI'}
     if re.fullmatch(r'\s*(?:好[的呀啊👌]*|收到|谢谢|好的谢谢|OK|ok|嗯[嗯好]*|[👍👌]+)\s*',line):

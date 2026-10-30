@@ -48,9 +48,37 @@ def contextual_standard(text):
     return line
 
 
+def independent_source_bets(parser,lottery,text):
+    """直接检查原文语义与单位，不以公共解析器是否成功作为证据前提。"""
+    from semantic import parse_message,atom_options
+    from parser import BetParser
+    probe=BetParser(parser.rules,parser.policy)
+    try:
+        result=parse_message(probe,lottery,text)
+        if result is not None:
+            return result[0],True
+        standard=contextual_standard(text)
+        result=parse_message(probe,lottery,standard)
+        if result is not None:
+            return result[0],True
+        options=atom_options(probe,lottery,standard)
+        if options and len(options[0])==1:
+            return options[0][0],True
+        # Public parser failure may reflect unsupported wording, so use the independent
+        # quantity/evidence normalization before the lower-level established grammar.
+        bets,_,_=probe._parse_pipeline(lottery,standard)
+        if bets:return bets,True
+    except (ValueError,KeyError):
+        pass
+    return [],False
+
+
 def source_bets(parser,lottery,text):
     """完整本地语法优先，其次逐块提取有语法证据的口语，不忽略未知语义。"""
     from parser import BetParser
+    independent,complete=independent_source_bets(parser,lottery,text)
+    if complete and independent:
+        return independent,True
     probe=BetParser(parser.rules,parser.policy)
     bets,_,_=probe.parse(lottery,text)
     if bets:

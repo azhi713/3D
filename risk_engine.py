@@ -14,7 +14,7 @@ def winning_indices(play, selection, span0_wins):
     for index, result in enumerate(RESULTS):
         unique = set(result)
         size = len(unique)
-        if size == 1 and play not in ('直选', '独胆', '一码定位', '两码定位', '三码定位', '豹子', '跨度0'):
+        if size == 1 and not play.startswith('和值') and play not in ('直选', '独胆', '一码定位', '两码定位', '三码定位', '豹子', '跨度0'):
             continue
         win = False
         if play == '直选':
@@ -42,6 +42,9 @@ def winning_indices(play, selection, span0_wins):
             win=size==(3 if play=='组六复式' else 2) and unique.issubset(set(selection))
         elif play.startswith('和值'):
             win=sum(map(int,result))==int(play[2:])
+        elif play.startswith('1胆'):
+            dan,tuo=selection.split(':')
+            win=size==(3 if play.endswith('组6') else 2) and dan in unique and (unique-{dan}).issubset(set(tuo))
         elif play.endswith('码组六'):
             win = size == 3 and unique.issubset(set(selection))
         elif play.endswith('码组三'):
@@ -74,7 +77,7 @@ class RiskEngine:
         if bet.play in ('组六复式','组三复式'):
             # 组六命中6条不同排列；组三命中同一重复数组的3条排列。
             return cents(rule['prize'])*(6 if bet.play=='组六复式' else 3)
-        return cents(rule.get('leopard_prize',1600) if bet.play == '直选' and len(set(result)) == 1 else rule['prize'])
+        return cents(rule.get('leopard_prize',1600) if bet.play in ('直选','三码定位') and len(set(result)) == 1 else rule['prize'])
 
     @staticmethod
     def expanded_tickets(bet):
@@ -101,7 +104,9 @@ class RiskEngine:
         for bet in bets:
             prize = int(round(self.prize_cents(lottery, bet, bet.selection) * float(bet.multiplier)))
             for index in winning_indices(bet.play, bet.selection, bool(self.policy.get('span0_wins'))):
-                payouts[index] += prize
+                actual=(int(round(self.prize_cents(lottery,bet,RESULTS[index])*float(bet.multiplier)))
+                        if bet.play=='三码定位' and index%111==0 else prize)
+                payouts[index] += actual
         rows = []
         for result, payout in zip(RESULTS, payouts):
             loss = payout - revenue_cents

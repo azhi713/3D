@@ -31,7 +31,7 @@ def message_blocks(text):
         incomplete_position = (bool(re.search(r'定位|[百十个](?:位)?\s*[:：]?\s*\d',pending.text))
                                and not re.search(r'倍|[元米块]',pending.text))
         lottery_header=re.fullmatch(r'(?:福|体|排|福彩|体彩|3[Dd])\s*[:：,，]?',pending.text)
-        position_continuation=bool(re.match(r'^(?:[百十个](?:位)?\s*[:：]?\s*\d|(?:定位|各|来)?\s*(?:\d|半|[一二两三四五六七八九十]))',block.text))
+        position_continuation=bool(re.match(r'^(?:[百十个](?:位)?\s*[:：]?\s*\d|(?:定位)?(?:各|来)?\s*(?:\d|半|[一二两三四五六七八九十]))',block.text))
         if lottery_header or number_header or (incomplete_position and position_continuation):
             pending=SourceBlock(pending.text+'\n'+block.text,pending.start,block.end)
         else:

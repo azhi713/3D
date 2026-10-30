@@ -56,6 +56,7 @@ class DataStore:
         ''')
         self.import_errors = []
         self.credential_error = ''
+        self.change_serial=0
 
     def _audit(self, action, obj):
         self.db.execute('INSERT INTO audit(timestamp,action,payload) VALUES(?,?,?)',
@@ -74,6 +75,7 @@ class DataStore:
                     return False
                 raise
             self._audit('添加原文', record.to_dict())
+        self.change_serial+=1
         return True
 
     def update(self, record, action='更新', expected_revision=None):
@@ -99,6 +101,7 @@ class DataStore:
                     ' VALUES(?,?,?,?,?)',
                     (record.record_id, now().isoformat(), action, old[0], new_payload))
             self._audit(action, record.to_dict())
+        self.change_serial+=1
 
     def delete(self, record):
         return self.delete_many([record.record_id])
@@ -122,6 +125,7 @@ class DataStore:
                 if changed == 1:
                     self._audit('删除', json.loads(row[0]))
                     deleted += 1
+        if deleted:self.change_serial+=1
         return deleted
 
     def get(self, record_id):
@@ -184,6 +188,7 @@ class DataStore:
         # 仅更新程序自带的旧版默认提示词；用户自行编辑的提示词绝不覆盖。
         saved_prompt = settings.get('ai', {}).get('prompt') or ''
         legacy_default_hashes = {
+            '8c38450fffb4c4e4a6159caaca0bbec89ea5932d0d253e07efbe34fa843f1562',
             '4c417912d05a502218648d78283337bd4f8e4ffab18b468eb3788a075e80df7f',
             'fd4cfae8a62172c5bf163994b9ac93d8a3d408363700aacd10a91afdadb4c7ad',
         }

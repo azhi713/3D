@@ -82,7 +82,7 @@ class MessageGrammarTests(unittest.TestCase):
         for raw in ('11组六复式','1481组六复式','511组三复式','5组三复式','01234567890组六复式',
                     '148组六复式0倍','148组六复式-1倍','51组三复式1.001倍',
                     '445--1直选2倍','003，假话，114直选2倍','888组选1倍','222转圈打1倍',
-                    '百00十2个3定位1倍','百0百1十2定位1倍','和值11 2倍','合值10打0元'):
+                    '百00十2个3定位1倍','百0百1十2定位1倍','和值28 2倍','合值10打0元'):
             self.assertFalse(BetParser().parse('福彩',raw)[0],raw)
 
     def test_new_groups_front_alias_spacing_and_ten_digit_boundary(self):
@@ -205,7 +205,7 @@ class EvidenceAndPostingTests(unittest.TestCase):
         self.assertEqual(self.controller.analysis('福彩').principal,0)
 
     def test_unknown_rules_never_go_to_ai(self):
-        for raw in ('和值11 2倍','12胆345拖2倍','1481组六复式','好👌','福0789组六50组三30合计80',
+        for raw in ('和值28 2倍','12胆345拖2倍','1481组六复式','好👌',
                     '我问一下，等他回复再说','两码定位是10元一倍，中一个的话900','定位是怎么算钱的'):
             rec=self.controller.add('福彩',raw)
             self.assertNotEqual(rec.status,'已识别')

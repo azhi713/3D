@@ -198,6 +198,17 @@ class Controller:
     @classmethod
     def _merge_ai_bets(cls, original_bets, candidate_bets):
         """AI可返回完整标准化消息，也可只返回疑难子项；不允许重复计入已验证投注。"""
+        if candidate_bets and all(b.parse_source=='ai_evidence_verified' for b in candidate_bets):
+            def identity(b):
+                span=b.source_span
+                return cls._bet_key(b)+(span.get('start'),span.get('end'))
+            existing=Counter(identity(b) for b in original_bets)
+            additional=[]
+            for bet in candidate_bets:
+                key=identity(bet)
+                if existing[key]:existing[key]-=1
+                else:additional.append(bet)
+            return original_bets+additional,additional
         original_count = Counter(cls._bet_key(b) for b in original_bets)
         proposed_count = Counter(cls._bet_key(b) for b in candidate_bets)
         if original_count and all(proposed_count[key] >= count for key, count in original_count.items()):
@@ -237,14 +248,12 @@ class Controller:
             return ''
         if not record.bets and unresolved.strip() == record.raw_text.strip():
             return unresolved
-        known = '\n'.join(f'{b.selection} {b.play} {b.multiplier:g}倍'
-                          for b in record.bets)
-        full = record.raw_text.strip()
-        return ('【需要理解的疑难片段】\n' + unresolved +
-                '\n【同一条消息完整原文（仅作语境依据）】\n' + full +
-                ('\n【本地已确认明细（不可重复入账、不得修改）】\n' + known if known else '') +
-                '\n【任务】请据原文还原所有明确的投注并输出完整规范化投注文本，'
-                '绝不能补写原文没有的号码、玩法或倍数；尾部自报总额仅用于核对，不是一笔新注。')
+        return json.dumps({'raw_text':record.raw_text,'lottery':record.lottery,
+                           'unresolved_spans':[{'text':p['text'],'start':p.get('start'),'end':p.get('end')}
+                                               for p in ai_fragments(record)],
+                           '本地已确认明细':[{'play':b.play,'code':b.selection,'multiplier':b.multiplier,
+                                                 'source_span':b.source_span} for b in record.bets],
+                           'instruction':'仅解释疑难；字符位置必须相对于raw_text；不得重复已确认购买'},ensure_ascii=False)
 
     def ai_text_for_record(self, record, allow_existing_candidate=False):
         """外部AI仅获得符合发送条件的疑难片段；违规与金额冲突不发送。"""
@@ -254,6 +263,8 @@ class Controller:
             return ''  # 无选号数字的纯聊天，不花费模型请求去编造投注。
         if record.ai_candidate and not allow_existing_candidate:
             return ''  # 已有AI候选待审，禁止重启后反复发送并重复扣费。
+        if record.ai_request_state in ('started','unknown_billing') and not allow_existing_candidate:
+            return ''
         if any(not frag.get('ai_eligible', False) for frag in record.pending_fragments):
             return ''  # 同一消息含违规上下文时，整体人工核对，防止AI错配片段。
         return '\n'.join(item['text'] for item in ai_fragments(record))
@@ -261,7 +272,7 @@ class Controller:
     @staticmethod
     def _annotate_bets(record, parser):
         """保留源文本片段，不在无法确定字符坐标时编造offset。"""
-        original = record.source_original_text or record.raw_text
+        original = record.raw_text
         for bet in record.bets:
             bet.rules_version = record.rules_version
             bet.unit_price_yuan = parser.rules[record.lottery][bet.play]['principal']
@@ -269,7 +280,9 @@ class Controller:
                 needle = bet.raw or ''
                 offset = original.find(needle) if needle and original.count(needle) == 1 else -1
                 bet.source_span = ({'start':offset, 'end':offset+len(needle), 'text':needle}
-                                   if offset >= 0 else {'text':needle, 'position_verified':False})
+                                   if offset >= 0 else {'text':original,'start':0,'end':len(original),
+                                                       'granularity':'message','normalized_fragment':needle})
+            bet.source_span.setdefault('reference','current_text')
 
     def parse_record(self, record, allow_conflict=False):
         parser = self.parser_for_record(record)
@@ -302,12 +315,31 @@ class Controller:
                 review_note = '；明确违规、冲突或已截止，AI候选不得改变原下注'
             else:
                 probe = BetParser(parser.rules, parser.policy)
-                ai_bets, candidate_normalized, ai_error = probe.parse(record.lottery, record.ai_candidate)
+                from ai_candidates import decode_candidate
+                ai_bets, candidate_normalized, ai_error = decode_candidate(record.ai_candidate,probe,record.lottery,text)
                 combined, additional = self._merge_ai_bets(bets, ai_bets)
                 # 不再拿“孤立的4/定位”与模型输出直接逐号比；必须对整条原文核验。
                 matches, validation_reason = ai_candidate_validation(
                     text, record.ai_candidate, combined, parser, record.lottery)
-                if not matches:
+                # Structured candidates may resolve only some independent pending spans.
+                # Each accepted span must be completely accounted for; untouched spans remain visible.
+                partial_accepted=False
+                if not matches and additional and all(b.parse_source=='ai_evidence_verified' for b in additional):
+                    from bet_evidence import independent_source_bets,ledger
+                    covered=[]
+                    for frag in pending:
+                        fragments=[b for b in additional if b.source_span.get('text')==frag['text']]
+                        expected,complete=independent_source_bets(parser,record.lottery,frag['text'])
+                        if fragments and complete and ledger(expected)==ledger(fragments):covered.append(frag)
+                    if covered and all(any(b.source_span.get('text')==f['text'] for f in covered) for b in additional):
+                        bets=combined
+                        pending=[f for f in pending if f not in covered]
+                        used_ai=True
+                        partial_accepted=True
+                        review_note='；AI已验证部分已入账，剩余疑难仍待核对' if pending else ''
+                if partial_accepted:
+                    pass
+                elif not matches:
                     review_note = '；AI复核未通过：' + (validation_reason if ai_bets else ('AI转换未通过本地校验：' + ai_error))
                 elif not additional and pending and not self._is_verified_total_note(text, pending, bets):
                     # AI只重复了已确定的订单，却没有处理剩余文字，不可假装已完成。
@@ -422,12 +454,14 @@ class Controller:
         record.raw_text = text
         record.received_amount = received
         record.ai_candidate = ''
+        record.ai_request_state = ''
         record.revision += 1
         self.parse_record(record)
         record.review_status = 'manually_confirmed'
         self.store.update(record, '人工修改')
 
     def reparse(self, record):
+        record.ai_request_state = ''
         record.revision += 1
         self.parse_record(record)
         self.store.update(record, '重新识别')
@@ -438,11 +472,12 @@ class Controller:
         record = self.store.get(record_id)
         if not record or record.revision != revision or record.status == '已识别':
             return False
-        source_text = self.ai_text_for_record(record)
+        source_text = self.ai_text_for_record(record,allow_existing_candidate=True)
         if not source_text:
             # 最关键的安全边界：无AI许可的违规订单不能靠模型改写后自动入账。
             return False
         record.ai_candidate = candidate
+        record.ai_request_state = 'responded'
         record.ai_history.append({'at':now().isoformat(), 'source_fragments':source_text,
                                   'candidate':candidate, 'reason':reason[:200]})
         self.parse_record(record)
@@ -501,7 +536,8 @@ class Controller:
              'fragments':[{'text':p.get('text',''), 'code':p.get('code','needs_review')}
                           for p in r.pending_fragments],
              'claimed_amount_yuan':r.claimed_amount}
-            for r in records if r.status != '已识别'
+            for r in records if r.status != '已识别' or r.parse_status=='amount_mismatch'
+            or any(b.settlement_rule_pending for b in r.bets)
         ]
         # 防止解封测试修改投注后，复用封盘前的快照做正式结算。
         record_signature = self._record_signature(records)
@@ -587,6 +623,7 @@ class Controller:
                     blockers.append('涉及重复数字双飞，兑奖边界尚未完成确认')
                 if bet.play == '三码组三':
                     blockers.append('涉及三码组三，兑奖覆盖边界尚未完成核验')
+                blockers.extend(bet.settlement_rule_pending)
         missing = [r for r in records if r.status != '已识别']
         if missing:
             blockers.append(f'还有{len(missing)}条未完全识别/待审核记录；其未确认部分没有计入')
@@ -631,6 +668,8 @@ class Controller:
         lines = []
         for record in records:
             for bet in record.bets:
+                if bet.settlement_rule_pending:
+                    raise ValueError('；'.join(bet.settlement_rule_pending))
                 if Decimal(str(bet.multiplier)) % 1 != 0:
                     raise ValueError('小数倍兑奖尚未确认，不允许自动计算派奖')
                 if bet.play == '双飞' and len(set(bet.selection)) == 1:
@@ -649,8 +688,8 @@ class Controller:
         self.store.save_settlement(period, lottery, draw, payload)
         return payload
 
-    def analysis(self, lottery):
-        records = [r for r in self.records() if r.lottery == lottery]
+    def analysis_inputs(self, lottery, records=None):
+        records = [r for r in (self.records() if records is None else records) if r.lottery == lottery]
         valid = [r for r in records if r.status == '已识别']
         # 只把逐笔本地验证通过的子项计入，未识别片段和整条实收都不混入。
         partial = [r for r in records if r.status in ('部分识别', 'AI识别中', 'AI待确认')
@@ -659,12 +698,23 @@ class Controller:
         revenue = (sum(cents(r.received_amount) if r.received_amount is not None else
                        sum(cents(b.principal) for b in r.bets) for r in valid)
                    + sum(cents(b.principal) for r in partial for b in r.bets))
-        principal, risks, payouts = self.engine.calculate(
+        args = (
             lottery, bets, self.settings['risk_threshold'], self.settings['external_direct_prize'][lottery],
             revenue/100, self.settings['threshold_metric'], self.settings['include_hedge_cost'],
             self.settings['direct_unit_cost'][lottery], self.settings['external_leopard_direct_prize'][lottery])
+        return deepcopy((self.rules,self.settings['policy'],args,revenue,
+                         len(records)-len(valid)+sum(any(b.settlement_rule_pending for b in r.bets) for r in valid),
+                         sum(r.received_amount is None for r in valid)))
+
+    @staticmethod
+    def calculate_analysis(inputs):
+        rules,policy,args,revenue,pending,unconfirmed=inputs
+        principal,risks,payouts=RiskEngine(rules,policy).calculate(*args)
         return Analysis(cents(principal), revenue, risks, payouts,
-                        len(records)-len(valid), sum(r.received_amount is None for r in valid))
+                        pending,unconfirmed)
+
+    def analysis(self, lottery):
+        return self.calculate_analysis(self.analysis_inputs(lottery))
 
     def save_settings(self, settings, rules):
         reprice=(rules!=self.rules or settings.get('policy')!=self.settings.get('policy')

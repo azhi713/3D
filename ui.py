@@ -25,6 +25,7 @@ from wechat_service import WeChatService
 from risk_engine import plan_text
 from data_contract import record_to_contract
 from draw_service import fetch_draw, DrawLookupError
+from ui_diff import sync_tree
 
 BG = '#f3f5fa'
 INK = '#17243b'
@@ -81,9 +82,9 @@ class RecordTable(tk.Frame):
         self.canvas.grid(row=1, column=0, sticky='nsew')
         self.vs.grid(row=1, column=1, sticky='ns')
         self.inner = tk.Frame(self.canvas, bg='white')
-        self.window_id = self.canvas.create_window((0,0), window=self.inner, anchor='nw')
-        self.inner.bind('<Configure>', lambda e:self.canvas.configure(scrollregion=self.canvas.bbox('all')))
-        self.canvas.bind('<Configure>', lambda e:self.canvas.itemconfigure(self.window_id, width=e.width))
+        # Individual canvas windows avoid a >32767px native child window on Windows.
+        self._layout_timer=None
+        self.canvas.bind('<Configure>', self._schedule_layout)
         self.canvas.bind('<MouseWheel>', self._wheel)
         self.inner.bind('<MouseWheel>', self._wheel)
         for widget in (header, self.canvas, self.inner):
@@ -95,6 +96,30 @@ class RecordTable(tk.Frame):
         if event.delta:
             self.canvas.yview_scroll(int(-event.delta/120), 'units')
         return 'break'
+
+    def _schedule_layout(self,event=None):
+        if not getattr(self.winfo_toplevel(),'_closing',False):
+            self._layout_rows()
+
+    def _layout_rows(self):
+        if self._layout_timer:
+            self.after_cancel(self._layout_timer)
+        self._layout_timer=None
+        width=max(1,self.canvas.winfo_width())
+        top=0
+        for row in self._rows.values():
+            height=max(1,row['frame'].winfo_reqheight())
+            self.canvas.coords(row['window'],0,top)
+            self.canvas.itemconfigure(row['window'],width=width,height=height)
+            row['top']=top;row['height']=height
+            top+=height
+        self.canvas.configure(scrollregion=(0,0,width,top))
+
+    def destroy(self):
+        if self._layout_timer:
+            self.after_cancel(self._layout_timer)
+            self._layout_timer=None
+        super().destroy()
 
     @staticmethod
     def _preview(text):
@@ -156,7 +181,8 @@ class RecordTable(tk.Frame):
     def _sync_checks(self):
         selected = set(self._selected)
         for iid, var in self._vars.items():
-            var.set(iid in selected)
+            if var.get() != (iid in selected):
+                var.set(iid in selected)
         self._header_select.set(bool(self._rows) and len(selected) == len(self._rows))
         for iid, row in self._rows.items():
             self._paint(iid, iid in selected)
@@ -169,6 +195,9 @@ class RecordTable(tk.Frame):
             return
         tags = row['tags']
         pending = 'pending' in tags
+        state=(pending,selected)
+        if row.get('paint_state')==state:return
+        row['paint_state']=state
         bg = '#dce8ff' if selected else ('#fff7ed' if pending else 'white')
         fg = RED if pending else INK
         row['frame'].configure(bg=bg)
@@ -205,9 +234,9 @@ class RecordTable(tk.Frame):
     def insert(self, parent, index, iid=None, values=(), tags=()):
         iid = str(iid)
         if iid in self._rows:
-            self.delete(iid)
-        frame = tk.Frame(self.inner, bg='white')
-        frame.pack(fill='x', expand=False)
+            self.update_row(iid,values,tags)
+            return iid
+        frame = tk.Frame(self.canvas, bg='white')
         var = tk.BooleanVar(value=False)
         chk = tk.Checkbutton(frame, variable=var, command=lambda i=iid:self._checkbox_toggle(i), bg='white', activebackground='white', bd=0)
         chk.grid(row=0,column=0,sticky='nsew',padx=2)
@@ -230,10 +259,57 @@ class RecordTable(tk.Frame):
                 w.bind('<Double-1>', lambda e,i=iid:self._row_double(i,e))
             w.bind('<Button-3>', lambda e,i=iid:self._row_right(i,e))
             w.bind('<MouseWheel>', self._wheel)
-        self._rows[iid]={'frame':frame,'widgets':widgets,'values':tuple(values),'tags':tuple(tags)}
+        window=self.canvas.create_window((0,0),window=frame,anchor='nw',width=max(1,self.canvas.winfo_width()))
+        self._rows[iid]={'frame':frame,'widgets':widgets,'values':tuple(values),'tags':tuple(tags),
+                         'window':window,'top':0,'height':1}
         self._vars[iid]=var
         self._paint(iid,False)
         return iid
+
+    def update_row(self,iid,values,tags=()):
+        row=self._rows[iid]
+        old_values=row['values']
+        for index,((key,_title,_width),widget) in enumerate(zip(self.columns,row['widgets'][1:])):
+            value=values[index] if index<len(values) else ''
+            old=old_values[index] if index<len(old_values) else ''
+            if value!=old:widget.configure(text=self._preview(value) if key=='raw' else str(value))
+        changed_tags=row['tags']!=tuple(tags)
+        row['values'],row['tags']=tuple(values),tuple(tags)
+        if changed_tags:self._paint(iid,iid in self._selected)
+
+    def sync_rows(self,rows):
+        before=list(self._rows)
+        desired=[str(r[0]) for r in rows]
+        wanted=set(desired)
+        top=self.canvas.canvasy(0)
+        anchor=None;offset=0
+        for iid,row in self._rows.items():
+            y=row.get('top',0)
+            if y<=top:anchor=iid;offset=top-y
+        counts={'insert':0,'update':0,'delete':0,'move':0}
+        removed=[iid for iid in before if iid not in wanted]
+        if removed:
+            self.delete(*removed)
+            counts['delete']=len(removed)
+        for iid,values,tags in rows:
+            iid=str(iid)
+            if iid not in self._rows:self.insert('','end',iid=iid,values=values,tags=tags);counts['insert']+=1
+            elif self._rows[iid]['values']!=tuple(values) or self._rows[iid]['tags']!=tuple(tags):
+                self.update_row(iid,values,tags);counts['update']+=1
+        if list(self._rows)!=desired:
+            self._rows={iid:self._rows[iid] for iid in desired}
+            counts['move']=len(desired)
+        if any(counts.values()):
+            self._layout_rows()
+            self.update_idletasks()
+            bounds=self.canvas.bbox('all') or (0,0,0,0)
+            self.canvas.configure(scrollregion=bounds)
+            if self._rows and anchor in self._rows:
+                target=self._rows[anchor]['top']+offset
+                self.canvas.yview_moveto(max(0,target)/max(1,bounds[3]))
+            elif not self._rows:self.canvas.yview_moveto(0)
+        self.last_diff=counts
+        return counts
 
     def _checkbox_toggle(self, iid):
         if self._vars[iid].get():
@@ -248,6 +324,7 @@ class RecordTable(tk.Frame):
             iid=str(iid)
             row=self._rows.pop(iid,None)
             if row:
+                self.canvas.delete(row['window'])
                 row['frame'].destroy()
             self._vars.pop(iid,None)
             if iid in self._selected:
@@ -261,6 +338,7 @@ class RecordTable(tk.Frame):
 
     def reset_scroll(self):
         """批量刷新数据后同步滚动范围，删除最后一行也保持空表正常布局。"""
+        self._layout_rows()
         self.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox('all') or (0, 0, 0, 0))
         self.canvas.yview_moveto(0)
@@ -307,6 +385,12 @@ class RiskApp(tk.Tk):
         self._draw_lookup_request = 0
         self.events = queue.Queue()
         self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='bet-ai')
+        self.risk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='risk-calc')
+        self._risk_generation = 0
+        self._risk_key = None
+        self._risk_running = False
+        self._risk_next = None
+        self._records_cache = (None, [])
         self.ai_key = self.controller.settings['ai'].get('api_key', '')
         self.controller.settings['ai']['enabled'] = bool(self.controller.settings['ai'].get('auto_start', self.controller.settings['ai'].get('enabled', False)))
         self.ai = AIService(self.controller.settings['ai'], self.ai_key, self.store.data_dir / 'ai_requests')
@@ -758,6 +842,8 @@ class RiskApp(tk.Tk):
 
     @staticmethod
     def set_text(widget, text):
+        if widget.get('1.0', 'end-1c') == text:
+            return
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
         widget.insert('1.0', text)
@@ -791,28 +877,63 @@ class RiskApp(tk.Tk):
     def refresh(self):
         self._sync_draw_context()
         lottery = self.lottery.get()
-        records = [r for r in self.controller.records() if r.lottery == lottery]
-        selection = self.records_tree.selection()
-        self.records_tree.delete(*self.records_tree.get_children())
+        cache_key = (self.store.change_serial,self.controller.period,lottery)
+        if self._records_cache[0] != cache_key:
+            records = [r for r in self.controller.records() if r.lottery == lottery]
+            self._records_cache = (cache_key,records)
+        else:
+            records = self._records_cache[1]
+        rows = []
         for record in records:
             has_partial = bool(record.bets and record.pending_fragments)
             amount = (money(sum(cents(b.principal) for b in record.bets)) +
                       ('（部分）' if has_partial else '')) if record.status == '已识别' or has_partial else '—'
-            self.records_tree.insert('', 'end', iid=record.record_id, values=(record.created_at[11:19], record.source, record.raw_text, amount, record.status), tags=() if record.status == '已识别' else ('pending',))
-        keep = [iid for iid in selection if self.records_tree.exists(iid)]
-        if keep:
-            self.records_tree.selection_set(keep)
-        self.records_tree.reset_scroll()
+            rows.append((record.record_id,(record.created_at[11:19], record.source, record.raw_text, amount, record.status),
+                         () if record.status == '已识别' else ('pending',)))
+        self.records_tree.sync_rows(rows)
         recognized = sum(r.status == '已识别' for r in records)
         self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 未识别{len(records)-recognized} · 已选{len(self.records_tree.selection())}')
         periods = list(dict.fromkeys([now().date().isoformat(), self.controller.period]+self.store.periods()))
         self.period_combo.configure(values=periods)
+        inputs = self.controller.analysis_inputs(lottery,records)
+        # Only financial inputs affect the 1000-outcome calculation; queue/status changes reuse it.
+        signature = repr((self.controller.period,lottery,inputs))
+        if signature == self._risk_key:
+            self.update_status()
+            return
+        self._risk_key = signature
+        self._risk_generation += 1
+        generation = self._risk_generation
+        if len(records) < 200:
+            self._apply_risk_snapshot(self.controller.calculate_analysis(inputs))
+        else:
+            self.copy_button.configure(state='disabled')
+            self.warning.configure(text='风险正在重新计算，当前显示为上次结果。',fg=RED)
+            self._risk_next = (generation,inputs)
+            self._start_risk_job()
+        self.update_status()
+
+    def _start_risk_job(self):
+        if self._risk_running or not self._risk_next or self._closing:
+            return
+        generation,inputs = self._risk_next
+        self._risk_next = None
+        self._risk_running = True
+        events = self.events
+        def worker():
+            try:
+                events.put(('risk_ready',generation,Controller.calculate_analysis(inputs),''))
+            except Exception as exc:
+                events.put(('risk_ready',generation,None,str(exc)))
+        self.risk_pool.submit(worker)
+
+    def _apply_risk_snapshot(self, snapshot, error=''):
+        lottery = self.lottery.get()
         previous_risk = self._risk_detail_number
-        self.risks_tree.delete(*self.risks_tree.get_children())
-        self.source_rows.delete(*self.source_rows.get_children())
-        self._risk_source_items = {}
         try:
-            self.snapshot = self.controller.analysis(lottery)
+            if error:
+                raise ValueError(error)
+            self.snapshot = snapshot
             self.error = ''
             self._render_risk_rows()
             if previous_risk and self.risks_tree.exists(previous_risk):
@@ -820,6 +941,8 @@ class RiskApp(tk.Tk):
                 self.show_sources()
             else:
                 self._risk_detail_number = None
+                sync_tree(self.source_rows,[])
+                self._risk_source_items = {}
                 self.risk_source_title.configure(text='投注来源 · 请选择上方号码')
                 self.set_text(self.sources, '点选风险号码，再点下方投注行查看原始消息和赔付计算依据。')
             self.risk_info.configure(text=f'{len(self.snapshot.risks)}个号码达到当前筛选条件  ·  点击号码查看原始投注与赔付依据')
@@ -827,6 +950,8 @@ class RiskApp(tk.Tk):
             for name, value in [('due', money(self.snapshot.principal)+'元'), ('income', money(self.snapshot.revenue)+'元'), ('risk', str(len(self.snapshot.risks))), ('loss', money(max(0, maximum))+'元')]:
                 self.cards[name].configure(text=value)
             text = plan_text(self.snapshot.risks, self.controller.settings['direct_unit_cost'][lottery])
+            if self.snapshot.pending:
+                text = '当前统计不完整，以下仅供核对已验证部分，不能作为最终补单方案。\n'+text
             self.set_text(self.plan, text)
             note = '已计入全部补单成本' if self.controller.settings['include_hedge_cost'] else '倍数计算忽略补单成本'
             self.plan_note.configure(text=note)
@@ -847,7 +972,7 @@ class RiskApp(tk.Tk):
             if self.store.import_errors:
                 warnings.append('部分旧数据迁入失败，请检查原文件。')
             self.warning.configure(text='  '.join(warnings) or '当前有效投注已完成计算。', fg=RED if warnings else MUTED)
-            self.copy_button.configure(state='normal' if any(r.plan_multiplier for r in self.snapshot.risks) else 'disabled')
+            self.copy_button.configure(state='normal' if not self.snapshot.pending and any(r.plan_multiplier for r in self.snapshot.risks) else 'disabled')
         except (ValueError, KeyError, sqlite3.Error) as exc:
             self.snapshot = None
             self.error = str(exc)
@@ -1455,6 +1580,8 @@ class RiskApp(tk.Tk):
             record = self.store.get(record.record_id)
         if not record or record.record_id in self.ai_busy:
             return
+        if force and record.ai_request_state=='started' and record.status=='AI识别中':
+            record.status='部分识别' if record.bets and record.pending_fragments else '待确认'
         # 用户主动处理旧待审单时先用当前本地核重试；升级后已能识别的不应付费发AI。
         if record.engine_version!=ENGINE_VERSION and record.status in ('待确认','部分识别'):
             self.controller.reparse(record)
@@ -1472,9 +1599,16 @@ class RiskApp(tk.Tk):
             return
         # 提交时带上同条原文与已确认投注语境，不能只发孤立的“4”或“定位”。
         ai_text = self.controller.ai_request_text(record, allow_existing_candidate=force)
-        if retry_feedback:
-            ai_text += ('\n【上次本地复核拒绝原因】' + retry_feedback[:320] +
-                        '\n请根据原始消息再次核对，勿编造新的号码或金额。')
+        if retry_feedback and ai_text:
+            try:
+                context=json.loads(ai_text)
+                if not isinstance(context,dict) or 'raw_text' not in context:raise ValueError()
+            except ValueError:
+                context={'raw_text':record.raw_text,'lottery':record.lottery}
+            context['validation_feedback']=retry_feedback[:320]
+            context['上次本地复核拒绝原因']=retry_feedback[:320]
+            context['feedback_instruction']='反馈不是新原文；仅依据raw_text重提候选，不增加购买次数'
+            ai_text=json.dumps(context,ensure_ascii=False)
         if not ai_text:
             if force:
                 if self.controller.cutoff_applies(record.period):
@@ -1499,6 +1633,7 @@ class RiskApp(tk.Tk):
             record.ai_candidate = ''
         revision = record.revision
         record.status = 'AI识别中'
+        record.ai_request_state = 'started'
         record.note = '正在转换，原文已保存；其他投注继续计算'
         self.store.update(record, '提交AI转换')
         self.ai_busy.add(record.record_id)
@@ -1577,6 +1712,9 @@ class RiskApp(tk.Tk):
     def pump(self):
         if self._closing:
             return
+        if self._timer:
+            self.after_cancel(self._timer)
+            self._timer=None
         dirty = False
         try:
             completed = self.controller.tick_deadline()
@@ -1635,6 +1773,7 @@ class RiskApp(tk.Tk):
                     record = self.store.get(record_id)
                     if record and record.revision == revision and record.status in ('待确认', 'AI识别中'):
                         record.status = '部分识别' if record.pending_fragments and record.bets else '待确认'
+                        record.ai_request_state = 'unknown_billing' if ('超时' in reason or 'timed out' in reason.lower()) else 'failed'
                         record.note = reason + ('；本地已识别部分仍保留' if record.bets else '')
                         if (self.controller.cutoff_applies(record.period)
                                 and not self.controller.ai_text_for_record(record)):
@@ -1647,6 +1786,12 @@ class RiskApp(tk.Tk):
                         dirty = True
                     elif record and record.revision != revision:
                         self.queue_ai(record)
+                elif event[0] == 'risk_ready':
+                    _,generation,snapshot,error = event
+                    self._risk_running = False
+                    if generation == self._risk_generation:
+                        self._apply_risk_snapshot(snapshot,error)
+                    self._start_risk_job()
                 elif event[0] == 'test':
                     _, label, result = event
                     if label.winfo_exists():
@@ -1719,11 +1864,8 @@ class RiskApp(tk.Tk):
             'plan': lambda r: r.plan_multiplier,
         }[key]
         rows.sort(key=lambda r: (keyfunc(r), r.number), reverse=self._risk_sort_reverse)
-        self.risks_tree.delete(*self.risks_tree.get_children())
-        for i, r in enumerate(rows):
-            self.risks_tree.insert('', 'end', iid=r.number,
-                                   values=(r.number, yuan_fmt(r.payout), yuan_fmt(r.net_loss), str(r.plan_multiplier)),
-                                   tags=('odd',) if i % 2 else ())
+        sync_tree(self.risks_tree,[(r.number,(r.number,yuan_fmt(r.payout),yuan_fmt(r.net_loss),str(r.plan_multiplier)),
+                                  ('odd',) if i % 2 else ()) for i,r in enumerate(rows)])
 
     def sort_risks(self, key):
         if key not in ('number', 'payout', 'loss', 'plan'):
@@ -1744,17 +1886,19 @@ class RiskApp(tk.Tk):
         number = selected[0]
         self._risk_detail_number = number
         matched = self.controller.explain(self.lottery.get(), number)
-        self.source_rows.delete(*self.source_rows.get_children())
+        old_selection = self.source_rows.selection()
         self._risk_source_items = {}
+        rows = []
         total = sum(payout for _rec, _bet, payout in matched)
         self.risk_source_title.configure(text=f'{number} · 命中{len(matched)}笔 · 合计赔付{yuan_fmt(total)}元')
         for i,(record,bet,payout) in enumerate(matched):
-            key=str(i)
+            key=record.record_id+':'+str(sum(item[0].record_id==record.record_id for item in matched[:i]))
             self._risk_source_items[key]=(record,bet,payout)
-            self.source_rows.insert('', 'end', iid=key, values=(bet.play, bet.selection,
-                                    f'{bet.multiplier:g}', yuan_fmt(payout),record.sender or record.source))
+            rows.append((key,(bet.play,bet.selection,f'{bet.multiplier:g}',yuan_fmt(payout),record.sender or record.source),()))
+        sync_tree(self.source_rows,rows)
         if matched:
-            self.source_rows.selection_set('0')
+            if not any(self.source_rows.exists(iid) for iid in old_selection):
+                self.source_rows.selection_set(rows[0][0])
             self.show_source_detail()
         else:
             self.set_text(self.sources, '本号码暂无命中投注。')
@@ -1794,7 +1938,7 @@ class RiskApp(tk.Tk):
         ttk.Button(root, text='关闭', command=win.destroy).pack(anchor='e', pady=(9, 0))
 
     def copy_plan(self):
-        if not self.snapshot:
+        if not self.snapshot or self.snapshot.pending or self._risk_running or self._risk_next:
             return
         self.clipboard_clear()
         self.clipboard_append(plan_text(self.snapshot.risks, self.controller.settings['direct_unit_cost'][self.lottery.get()]))
@@ -2459,5 +2603,10 @@ class RiskApp(tk.Tk):
             self._wechat_start_timer = None
         self.wechat.stop()
         self.pool.shutdown(wait=False, cancel_futures=True)
+        self.risk_pool.shutdown(wait=False, cancel_futures=True)
+        # Cancel every pending timer in this window's Tcl interpreter before child
+        # widgets delete their registered callback commands (including after_idle layout).
+        for timer in self.tk.call('after','info'):
+            self.tk.call('after','cancel',timer)
         self.store.close()
         self.destroy()

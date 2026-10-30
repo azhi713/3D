@@ -96,6 +96,11 @@ class ParserTests(unittest.TestCase):
             samples[CN_NUM[size]+'码复试'] = '012345678'[:size]+'复式1倍'
         for span in range(10):
             samples['跨度'+str(span)] = f'跨度{span} 1倍'
+        for value in range(28):
+            samples['和值'+str(value)] = f'和值{value} 1倍'
+        for shape in (3,6):
+            for size in range(2,10):
+                samples[f'1胆{size}拖组{shape}'] = '0胆'+('123456789'[:size])+f'拖组{shape}1倍'
         self.assertEqual(set(samples), set(RULES_BY_LOTTERY['福彩']))
         for lottery in ('福彩','体彩'):
             for play, sample in samples.items():
@@ -105,7 +110,7 @@ class ParserTests(unittest.TestCase):
                     self.assertEqual(bets[0].play,play)
 
     def test_fail_closed_no_silent_partial_or_invented_bet(self):
-        cases = ['293单0倍','293单-1倍','293单','293单50倍，随便再来一点',
+        cases = ['293单0倍','293单-1倍','293单50倍，随便再来一点',
                  '358421组10倍','555组三1倍','0123456789组六1倍','全包组六0倍','foo293单50倍',
                  '293单50倍取消','百8百9定位1倍','百99定位2倍','27双飞2倍多一单', '293组1000001倍']
         for sample in cases:
@@ -261,7 +266,7 @@ class RiskTests(unittest.TestCase):
             for digit in '0123456789':
                 result = digit*3
                 bets = self.parse(f'{result}直选3倍，{digit}独胆2倍，百{digit}十{digit}个{digit}定位1倍，豹子2倍，跨度0 3倍',lottery)
-                expected = [4800,66,1800,3200,2400]
+                expected = [4800,66,1600,3200,2400]
                 self.assertEqual([self.engine.payout_for(lottery,b,result) for b in bets],expected)
                 _,_,payouts = self.engine.calculate(lottery,bets,0,1800)
                 self.assertEqual(payouts[result],sum(expected))

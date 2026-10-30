@@ -36,6 +36,7 @@ class Bet:
     source_span: dict = field(default_factory=dict)
     parse_source: str = 'local'
     rules_version: str = ''
+    settlement_rule_pending: list = field(default_factory=list)
 
     def to_dict(self):
         return asdict(self)
@@ -75,6 +76,7 @@ class MessageRecord:
     engine_version: str = ''
     deadline_state: str = ''
     ai_history: list = field(default_factory=list)
+    ai_request_state: str = ''  # started/unknown_billing survives restart; never blindly re-submit.
 
     def to_dict(self):
         obj = asdict(self)

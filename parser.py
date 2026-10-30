@@ -154,6 +154,26 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        from semantic import parse_message,SemanticError,requires_semantic
+        base=self._parse_pipeline(lottery,text)
+        metadata=(self.last_claimed,list(self.last_receipts),list(self.last_warnings))
+        if base[0] and not requires_semantic(text):
+            return base
+        try:
+            result=parse_message(self,lottery,text)
+        except (SemanticError,ValueError,KeyError) as exc:
+            self.last_claimed=getattr(exc,'declared',None)
+            self.last_warnings=[]
+            self.last_receipts=[]
+            return [],self.normalize_text(text),str(exc)
+        if result is not None:
+            bets,declared,receipts,warnings=result
+            self.last_claimed,self.last_receipts,self.last_warnings=declared,receipts,warnings
+            return bets,self.normalize_text(text),''
+        self.last_claimed,self.last_receipts,self.last_warnings=metadata
+        return base
+
+    def _parse_pipeline(self, lottery, text):
         """消息先分块/标注金额；玩法与收费仍由同一组严格校验负责。"""
         self.last_claimed=None
         self.last_warnings=[]
@@ -519,7 +539,10 @@ class BetParser:
             # 复试与其它玩法一样，严格使用《明细规则2.xlsx》的固定单倍本金。
             cost = cents(rule['principal'])
         principal = Decimal(cost) * Decimal(str(mult)) / 100
-        return Bet(play, selection, mult, float(principal), raw)
+        bet=Bet(play, selection, mult, float(principal), raw)
+        if re.fullmatch(r'1胆[2-9]拖组3',play):
+            bet.settlement_rule_pending=['组三胆拖重号极端覆盖仍待确认']
+        return bet
 
     @staticmethod
     def validate(play, selection, mult):
@@ -531,6 +554,14 @@ class BetParser:
         if (type(mult) is bool or not number.is_finite() or
                 number <= 0 or number > 1000000 or number.as_tuple().exponent < -2):
             raise ValueError('倍数必须为正数，最多两位小数')
+        if re.fullmatch(r'1胆[2-9]拖组[36]',play):
+            if not re.fullmatch(r'[0-9]:[0-9]{2,9}',selection):
+                raise ValueError('胆码/拖码格式不合法')
+            dan,tuo=selection.split(':')
+            if dan in tuo or len(set(tuo))!=len(tuo):
+                raise ValueError('胆码拖码不能重叠，拖码不能重复')
+            if len(tuo)!=int(play[2]):raise ValueError('拖码数量与赔率档位不符')
+            return
         if play.endswith('码定位'):
             items = selection.split('|')
             parts = [item.split(':') for item in items]
@@ -551,8 +582,8 @@ class BetParser:
         if not re.fullmatch(r'[0-9]+', selection):
             raise ValueError('号码必须是0～9组成的数字')
         if play.startswith('和值'):
-            if selection!='10' or play!='和值10':
-                raise ValueError('该和值本金和奖金尚未确认')
+            if not selection.isdigit() or not 0<=int(selection)<=27 or play!='和值'+str(int(selection)):
+                raise ValueError('和值须为0～27')
             return
         if play.startswith('跨度'):
             if selection != play[-1]:
