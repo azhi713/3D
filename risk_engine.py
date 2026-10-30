@@ -3,6 +3,7 @@ from functools import lru_cache
 from fractions import Fraction
 from config import RULES_BY_LOTTERY
 from models import RiskRow, cents, money
+from itertools import permutations, combinations
 
 RESULTS = tuple(f'{i:03d}' for i in range(1000))
 
@@ -23,7 +24,9 @@ def winning_indices(play, selection, span0_wins):
         elif play == '独胆':
             win = selection in result
         elif play == '双飞':
-            win = set(selection).issubset(unique)
+            # 双飞相同数字必须在开奖号码中出现至少两次；豹子按现有规则另行排除。
+            win = (result.count(selection[0]) >= 2 if selection[0] == selection[1]
+                   else set(selection).issubset(unique))
         elif play == '对子':
             win = result.count(selection[0]) == 2
         elif play == '豹子':
@@ -35,6 +38,10 @@ def winning_indices(play, selection, span0_wins):
             win = size == 3
         elif play == '全包组三':
             win = size == 2
+        elif play in ('组六复式','组三复式'):
+            win=size==(3 if play=='组六复式' else 2) and unique.issubset(set(selection))
+        elif play.startswith('和值'):
+            win=sum(map(int,result))==int(play[2:])
         elif play.endswith('码组六'):
             win = size == 3 and unique.issubset(set(selection))
         elif play.endswith('码组三'):
@@ -64,7 +71,19 @@ class RiskEngine:
 
     def prize_cents(self, lottery, bet, result):
         rule = self.rules[lottery][bet.play]
+        if bet.play in ('组六复式','组三复式'):
+            # 组六命中6条不同排列；组三命中同一重复数组的3条排列。
+            return cents(rule['prize'])*(6 if bet.play=='组六复式' else 3)
         return cents(rule.get('leopard_prize',1600) if bet.play == '直选' and len(set(result)) == 1 else rule['prize'])
+
+    @staticmethod
+    def expanded_tickets(bet):
+        if bet.play=='组六复式':
+            return tuple(''.join(items) for items in permutations(bet.selection,3))
+        if bet.play=='组三复式':
+            return tuple(sorted({''.join(items) for pair in combinations(bet.selection,2)
+                                 for repeated in pair for items in permutations(repeated*2+next(d for d in pair if d!=repeated))}))
+        return (bet.selection,)
 
     def calculate(self, lottery, bets, threshold, external_direct_prize, revenue=None,
                   metric='payout', hedge_cost=None, unit_cost=2, leopard_direct_prize=1600):

@@ -89,6 +89,11 @@ class AIService:
         self.api_key = api_key
         self.connected = False
         self.log_dir = Path(log_dir) if log_dir else None
+        self._timing_local=threading.local()
+
+    @property
+    def last_metrics(self):
+        return dict(getattr(self._timing_local,'metrics',{}))
 
     def _log(self, stage, **details):
         if self.log_dir is None:
@@ -140,8 +145,11 @@ class AIService:
         timeout = effective_timeout(self.config)
         rid = datetime.now().strftime('%H%M%S%f') + '-' + str(threading.get_ident())
         self.connected = False
+        metrics={'response_s':0.0,'json_s':0.0,'request_build_s':0.0}
+        self._timing_local.metrics=metrics
         try:
             request = self._build_request(messages)
+            metrics['request_build_s']=time.perf_counter()-started
             legacy = request.full_url.endswith('/completions') and not request.full_url.endswith('/chat/completions')
             parsed_url = urlsplit(request.full_url)
             # URL仅保留安全的scheme/host/path；不含凭据及查询字符串。
@@ -149,13 +157,16 @@ class AIService:
             self._log('开始请求', request_id=rid, model=self.config.get('model', ''),
                       endpoint=_redact(endpoint, self.api_key, messages), mode='completions' if legacy else 'chat',
                       timeout_s=timeout, request_bytes=len(request.data or b''))
+            response_started=time.perf_counter()
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 self._log('收到响应头', request_id=rid, http_status=response.status,
                           elapsed_s=round(time.perf_counter()-started,3))
                 raw = response.read(_MAX_REPLY+1)
+            metrics['response_s']=time.perf_counter()-response_started
             self._log('收到完整响应', request_id=rid, elapsed_s=round(time.perf_counter()-started,3), response_bytes=len(raw))
             if len(raw)>_MAX_REPLY:
                 raise AIError('AI返回内容超过1MB，原始数据已保存')
+            json_started=time.perf_counter()
             try:
                 obj = json.loads(raw)
                 content = obj['choices'][0]['text'] if legacy else obj['choices'][0]['message']['content']
@@ -169,6 +180,7 @@ class AIService:
             except (ValueError, KeyError, TypeError, IndexError) as err:
                 raise AIError('AI返回格式错误：'+type(err).__name__+'；未能解析为程序需要的JSON对象，原始数据已保存') from None
             self.connected = True
+            metrics['json_s']=time.perf_counter()-json_started
             self._log('JSON解析成功', request_id=rid, elapsed_s=round(time.perf_counter()-started,3), result_field_count=len(answer))
             return answer
         except urllib.error.HTTPError as exc:
@@ -191,6 +203,9 @@ class AIService:
         except AIError as exc:
             self._log('识别失败', request_id=rid, elapsed_s=round(time.perf_counter()-started,3), error=_redact(str(exc),self.api_key,messages))
             raise
+        finally:
+            metrics['api_total_s']=time.perf_counter()-started
+            self._timing_local.metrics=dict(metrics)
 
     def test_connection(self):
         self._request([{'role': 'system', 'content': '只返回JSON对象 {"ok":true}'},

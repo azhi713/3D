@@ -1,12 +1,18 @@
 """事务存储原文；旧JSON只读迁入，损坏时明确报错，绝不当作空数据。"""
 import json
+import hashlib
+import re
 import sqlite3
 from contextlib import closing
 from copy import deepcopy
 from pathlib import Path
-from config import DEFAULT_SETTINGS, LOTTERIES
+from config import DEFAULT_SETTINGS, DEFAULT_AI_PROMPT, LOTTERIES
 from models import MessageRecord, now
 from credentials import protect_key, unprotect_key, CredentialError
+
+
+class StaleRecordError(ValueError):
+    pass
 
 
 class DataStore:
@@ -34,6 +40,19 @@ class DataStore:
                 payload TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(source_id,group_id));
             CREATE TABLE IF NOT EXISTS period_rules (period TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS record_revisions (
+                id INTEGER PRIMARY KEY, record_id TEXT NOT NULL, timestamp TEXT NOT NULL,
+                action TEXT NOT NULL, before_payload TEXT NOT NULL, after_payload TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS record_revision_index ON record_revisions(record_id,id);
+            CREATE TABLE IF NOT EXISTS batch_snapshots (
+                period TEXT NOT NULL, lottery TEXT NOT NULL, state TEXT NOT NULL,
+                frozen_at TEXT NOT NULL, frozen_payload TEXT NOT NULL,
+                finalized_at TEXT, final_payload TEXT,
+                PRIMARY KEY(period,lottery));
+            CREATE TABLE IF NOT EXISTS settlements (
+                period TEXT NOT NULL, lottery TEXT NOT NULL, draw TEXT NOT NULL,
+                created_at TEXT NOT NULL, payload TEXT NOT NULL,
+                PRIMARY KEY(period,lottery));
         ''')
         self.import_errors = []
         self.credential_error = ''
@@ -43,6 +62,8 @@ class DataStore:
                         (now().isoformat(), action, json.dumps(obj, ensure_ascii=False)))
 
     def insert(self, record):
+        if not record.source_original_text:
+            record.source_original_text = record.raw_text
         with self.db:
             try:
                 self.db.execute('INSERT INTO records(id,period,lottery,source_id,source,payload) VALUES(?,?,?,?,?,?)',
@@ -55,18 +76,53 @@ class DataStore:
             self._audit('添加原文', record.to_dict())
         return True
 
-    def update(self, record, action='更新'):
+    def update(self, record, action='更新', expected_revision=None):
         with self.db:
-            changed = self.db.execute('UPDATE records SET payload=? WHERE id=? AND deleted=0',
-                                     (json.dumps(record.to_dict(), ensure_ascii=False), record.record_id)).rowcount
+            old = self.db.execute('SELECT payload FROM records WHERE id=? AND deleted=0',
+                                  (record.record_id,)).fetchone()
+            if not old:
+                raise StaleRecordError('记录不存在或已删除')
+            if expected_revision is not None and json.loads(old[0]).get('revision',0)!=expected_revision:
+                raise StaleRecordError('记录已修改，迟到结果未写入')
+            new_payload = json.dumps(record.to_dict(), ensure_ascii=False)
+            condition='UPDATE records SET payload=? WHERE id=? AND deleted=0'
+            values=[new_payload,record.record_id]
+            if expected_revision is not None:
+                condition+=' AND payload=?'
+                values.append(old[0])
+            changed = self.db.execute(condition,values).rowcount
             if changed != 1:
-                raise ValueError('记录不存在或已删除')
+                raise StaleRecordError('记录已删除或修改，迟到结果未写入')
+            if old[0] != new_payload:
+                self.db.execute(
+                    'INSERT INTO record_revisions(record_id,timestamp,action,before_payload,after_payload)'
+                    ' VALUES(?,?,?,?,?)',
+                    (record.record_id, now().isoformat(), action, old[0], new_payload))
             self._audit(action, record.to_dict())
 
     def delete(self, record):
+        return self.delete_many([record.record_id])
+
+    def delete_many(self, record_ids):
+        """批量软删除：整批成功或整批回滚，审计保留，后台AI不能写回。"""
+        ids = list(dict.fromkeys(str(item) for item in record_ids if item))
+        if not ids:
+            return 0
+        deleted = 0
         with self.db:
-            self.db.execute('UPDATE records SET deleted=1 WHERE id=?', (record.record_id,))
-            self._audit('删除', record.to_dict())
+            for record_id in ids:
+                row = self.db.execute(
+                    'SELECT payload FROM records WHERE id=? AND deleted=0', (record_id,)
+                ).fetchone()
+                if row is None:
+                    continue
+                changed = self.db.execute(
+                    'UPDATE records SET deleted=1 WHERE id=? AND deleted=0', (record_id,)
+                ).rowcount
+                if changed == 1:
+                    self._audit('删除', json.loads(row[0]))
+                    deleted += 1
+        return deleted
 
     def get(self, record_id):
         row = self.db.execute('SELECT payload FROM records WHERE id=? AND deleted=0', (record_id,)).fetchone()
@@ -125,6 +181,14 @@ class DataStore:
                 merge(settings, saved)
                 settings['threshold_metric'] = 'payout'
                 settings['plan_total_mode'] = 'money'
+        # 仅更新程序自带的旧版默认提示词；用户自行编辑的提示词绝不覆盖。
+        saved_prompt = settings.get('ai', {}).get('prompt') or ''
+        legacy_default_hashes = {
+            '4c417912d05a502218648d78283337bd4f8e4ffab18b468eb3788a075e80df7f',
+            'fd4cfae8a62172c5bf163994b9ac93d8a3d408363700aacd10a91afdadb4c7ad',
+        }
+        if saved_prompt and hashlib.sha256(saved_prompt.encode('utf-8')).hexdigest() in legacy_default_hashes:
+            settings['ai']['prompt'] = DEFAULT_AI_PROMPT
         protected = settings.get('ai', {}).pop('api_key_encrypted', '')
         self.credential_error = ''
         if protected:
@@ -159,6 +223,70 @@ class DataStore:
         row = self.db.execute('SELECT payload FROM period_rules WHERE period=?', (period,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def load_batch(self, period, lottery):
+        row = self.db.execute(
+            'SELECT state,frozen_at,frozen_payload,finalized_at,final_payload FROM batch_snapshots'
+            ' WHERE period=? AND lottery=?', (period,lottery)).fetchone()
+        if not row:
+            return None
+        return {'state':row[0], 'frozen_at':row[1], 'frozen':json.loads(row[2]),
+                'finalized_at':row[3], 'final':json.loads(row[4]) if row[4] else None}
+
+    def freeze_batch(self, period, lottery, snapshot, timestamp):
+        """冻结快照只写一次，避免之后的AI/人工修改覆盖截止时的数据。"""
+        with self.db:
+            changed = self.db.execute(
+                'INSERT OR IGNORE INTO batch_snapshots'
+                '(period,lottery,state,frozen_at,frozen_payload) VALUES(?,?,?,?,?)',
+                (period, lottery, 'frozen', timestamp,
+                 json.dumps(snapshot, ensure_ascii=False))).rowcount
+            if changed:
+                self._audit('21:14冻结批次', {'period':period,'lottery':lottery,'at':timestamp})
+        return bool(changed)
+
+    def finalize_batch(self, period, lottery, summary, timestamp):
+        """截止快照独立保存；最终统计也只允许第一次成功写入。"""
+        with self.db:
+            changed = self.db.execute(
+                'UPDATE batch_snapshots SET state=?,finalized_at=?,final_payload=?'
+                ' WHERE period=? AND lottery=? AND state=?',
+                ('finalized', timestamp, json.dumps(summary, ensure_ascii=False),
+                 period, lottery, 'frozen')).rowcount
+            if changed:
+                self._audit('批次汇总完成', {'period':period,'lottery':lottery,'at':timestamp})
+        return bool(changed)
+
+    def record_history(self, record_id):
+        return [
+            {'timestamp':row[0], 'action':row[1],
+             'before':json.loads(row[2]), 'after':json.loads(row[3])}
+            for row in self.db.execute(
+                'SELECT timestamp,action,before_payload,after_payload'
+                ' FROM record_revisions WHERE record_id=? ORDER BY id', (record_id,))
+        ]
+
+    def save_settlement(self, period, lottery, draw, payload):
+        """独立于下注记录、首次写入后不可覆盖的兑奖账本。"""
+        if not re.fullmatch(r'[0-9]{3}', draw):
+            raise ValueError('开奖号码必须为三位数字，000也有效')
+        with self.db:
+            existing = self.db.execute(
+                'SELECT draw FROM settlements WHERE period=? AND lottery=?',
+                (period,lottery)).fetchone()
+            if existing:
+                raise ValueError('本期已经结算，不能覆盖旧开奖结果或派奖账本')
+            self.db.execute(
+                'INSERT INTO settlements(period,lottery,draw,created_at,payload)'
+                ' VALUES(?,?,?,?,?)',
+                (period,lottery,draw,now().isoformat(),json.dumps(payload,ensure_ascii=False)))
+            self._audit('独立开奖结果结算', {'period':period,'lottery':lottery,'draw':draw})
+
+    def load_settlement(self, period, lottery):
+        row = self.db.execute(
+            'SELECT payload FROM settlements WHERE period=? AND lottery=?',
+            (period,lottery)).fetchone()
+        return json.loads(row[0]) if row else None
+
     @staticmethod
     def enqueue(path, payload):
         # 接收线程独立连接，HTTP成功返回前已持久保存。
@@ -185,6 +313,12 @@ class DataStore:
     def mark_inbox_processed(self, inbox_id):
         with self.db:
             self.db.execute('UPDATE inbox SET processed=1 WHERE id=?', (inbox_id,))
+
+    def mark_inbox_rejected(self, inbox_id, reason):
+        """逾期收件仍保留原payload和审计证据，不默默删掉原文。"""
+        with self.db:
+            self.db.execute('UPDATE inbox SET processed=2 WHERE id=? AND processed=0', (inbox_id,))
+            self._audit('截止后拒收收件箱消息', {'inbox_id':inbox_id,'reason':reason})
 
 
 def merge(target, source):

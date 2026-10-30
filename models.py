@@ -28,16 +28,21 @@ def money(value):
 class Bet:
     play: str
     selection: str
-    multiplier: int
+    multiplier: int | float
     principal: float
     raw: str = ''
+    unit_price_yuan: float | None = None
+    entered_amount_yuan: float | None = None
+    source_span: dict = field(default_factory=dict)
+    parse_source: str = 'local'
+    rules_version: str = ''
 
     def to_dict(self):
         return asdict(self)
 
     @classmethod
     def from_dict(cls, obj):
-        return cls(**{key: obj[key] for key in ('play', 'selection', 'multiplier', 'principal', 'raw') if key in obj})
+        return cls(**{key: obj[key] for key in cls.__dataclass_fields__ if key in obj})
 
 
 @dataclass
@@ -59,6 +64,17 @@ class MessageRecord:
     claimed_amount: float | None = None
     revision: int = 0
     ai_candidate: str = ''
+    pending_fragments: list = field(default_factory=list)  # 原文位置与未识别原因，仅供AI/人工处理
+    source_original_text: str = ''  # 接收时原文，人工改写raw_text时仍保留
+    parse_status: str = 'needs_review'
+    review_status: str = 'not_manually_reviewed'
+    issues: list = field(default_factory=list)
+    declared_total_yuan: float | None = None
+    computed_amount_yuan: float | None = None
+    rules_version: str = ''
+    engine_version: str = ''
+    deadline_state: str = ''
+    ai_history: list = field(default_factory=list)
 
     def to_dict(self):
         obj = asdict(self)

@@ -1,0 +1,553 @@
+--- 原始/ui.py
++++ 新版/ui.py
+@@ -325,10 +325,11 @@
+         self.base_dir = Path(base_dir)
+         self.title(APP_NAME+' · '+APP_VERSION)
+         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+-        width = min(1440, max(1120, screen_w-100))
+-        height = min(980, max(800, screen_h-70))
++        # 小屏幕优先给正文留出空间，不允许默认高度超出物理屏幕。
++        width = min(1440, max(960, screen_w-80))
++        height = min(980, max(630, screen_h-85))
+         self.geometry(f'{width}x{height}')
+-        self.minsize(1120, 780)
++        self.minsize(min(1040, max(900, screen_w-80)), min(700, max(590, screen_h-85)))
+         self.configure(bg=BG)
+         self.store = DataStore(base_dir)
+         self.controller = Controller(self.store)
+@@ -406,124 +407,143 @@
+         style.configure('On.TButton', background='#e8f7ee', foreground='#167647')
+         style.configure('Off.TButton', background='#fff0f1', foreground=RED)
+         style.configure('Warn.TButton', background='#fff5e8', foreground=ORANGE)
++        style.configure('TNotebook.Tab', padding=(17, 9), font=('Microsoft YaHei UI', 10, 'bold'))
+ 
+     def _build(self):
++        """三区工作台：常驻信息 + 投注录入 / 实时风险 / 开奖结算。只变更布局。"""
++        pad = 18
++        # 顶部品牌栏仅保留页面标题和设置，不再混放状态及业务按钮。
+         header = tk.Frame(self, bg=INK)
+         header.pack(fill='x')
+-        tk.Label(header, text=APP_NAME, bg=INK, fg='white', font=('Microsoft YaHei UI', 19, 'bold')).pack(side='left', padx=24, pady=14)
+-        tk.Label(header, text='实时赔付分析', bg=INK, fg='#a8bddb').pack(side='left')
+-        ttk.Button(header, text='设置', command=self.settings_dialog).pack(side='right', padx=24)
+-
+-        ops = tk.Frame(self, bg='white', bd=1, relief='solid')
+-        ops.pack(fill='x', padx=24, pady=(12, 8))
+-        left = tk.Frame(ops, bg='white')
+-        left.pack(side='left', fill='x', expand=True, padx=12, pady=10)
+-        self.wechat_toggle_btn = ttk.Button(left, text='微信监听：关', command=self.toggle_wechat)
+-        self.wechat_toggle_btn.pack(side='left', padx=(0,8))
+-        self.ai_toggle_btn = ttk.Button(left, text='AI识别：关', command=self.toggle_ai)
+-        self.ai_toggle_btn.pack(side='left', padx=(0,8))
+-        self.history_button = ttk.Button(left, text='读取历史消息', command=self.history_dialog)
+-        self.history_button.pack(side='left', padx=(0,12))
+-        self.pending_label = tk.Label(left, text='待处理：0', bg='white', fg=INK, font=('Microsoft YaHei UI',10,'bold'))
+-        self.pending_label.pack(side='left', padx=(4,12))
+-        self.group_label = tk.Label(left, text='', bg='white', fg=MUTED, anchor='w')
+-        self.group_label.pack(side='left', fill='x', expand=True)
+-        self.status = tk.Label(ops, bg='white', fg=MUTED, anchor='e')
+-        self.status.pack(side='right', padx=12)
+-
+-        bar = ttk.Frame(self)
+-        bar.pack(fill='x', padx=24, pady=(2,8))
+-        for lottery, title in [('福彩', '福彩3D'), ('体彩', '体彩排列三')]:
+-            ttk.Radiobutton(bar, text=title, value=lottery, variable=self.lottery, command=self.refresh).pack(side='left', padx=(0, 20))
+-        ttk.Label(bar, text='日期／期号').pack(side='left', padx=(10, 6))
+-        self.period_combo = ttk.Combobox(bar, textvariable=self.period, width=13)
++        title_area = tk.Frame(header, bg=INK)
++        title_area.pack(side='left', padx=pad, pady=10)
++        tk.Label(title_area, text=APP_NAME, bg=INK, fg='white',
++                 font=('Microsoft YaHei UI', 17, 'bold')).pack(side='left')
++        tk.Label(title_area, text='  /  实时风险工作台', bg=INK,
++                 fg='#a8bddb').pack(side='left', padx=(6, 0))
++        ttk.Button(header, text='设置', command=self.settings_dialog).pack(side='right', padx=pad)
++
++        # 运行开关集中在一行。长群名、连接日志放到窗口底部状态栏。
++        controls = tk.Frame(self, bg='white', bd=1, relief='solid')
++        controls.pack(fill='x', padx=pad, pady=(10, 7))
++        switches = ttk.Frame(controls)
++        switches.pack(side='left', padx=11, pady=8)
++        self.wechat_toggle_btn = ttk.Button(switches, text='微信监听：关', command=self.toggle_wechat)
++        self.wechat_toggle_btn.pack(side='left', padx=(0, 8))
++        self.ai_toggle_btn = ttk.Button(switches, text='AI识别：关', command=self.toggle_ai)
++        self.ai_toggle_btn.pack(side='left', padx=(0, 8))
++        self.history_button = ttk.Button(switches, text='读取历史消息', command=self.history_dialog)
++        self.history_button.pack(side='left')
++        self.pending_label = tk.Label(controls, text='待处理：0', bg='white', fg=INK,
++                                      font=('Microsoft YaHei UI', 10, 'bold'))
++        self.pending_label.pack(side='right', padx=(10, 15))
++
++        # 当前统计范围、筛选条件和导出操作三组明确分区。
++        context = ttk.Frame(self)
++        context.pack(fill='x', padx=pad, pady=(0, 7))
++        scope = ttk.Frame(context)
++        scope.pack(side='left')
++        for lottery, text in [('福彩', '福彩3D'), ('体彩', '体彩排列三')]:
++            ttk.Radiobutton(scope, text=text, value=lottery, variable=self.lottery,
++                            command=self.refresh).pack(side='left', padx=(0, 13))
++        ttk.Label(scope, text='日期 / 期号').pack(side='left', padx=(3, 5))
++        self.period_combo = ttk.Combobox(scope, textvariable=self.period, width=12)
+         self.period_combo.pack(side='left')
+         self.period_combo.bind('<<ComboboxSelected>>', self.switch_period)
+         self.period_combo.bind('<Return>', self.switch_period)
+-        ttk.Label(bar, text='显示').pack(side='left', padx=(24, 6))
+-        metric_box = ttk.Combobox(bar, textvariable=self.metric, values=['总赔付', '净亏损'], width=7, state='readonly')
++
++        exports = ttk.Frame(context)
++        exports.pack(side='right', padx=(12, 0))
++        self.export_menu = tk.Menu(self, tearoff=False)
++        for text, action in [
++            ('当前数据 CSV', self.export_csv),
++            ('投注明细 CSV', self.export_detail_csv),
++            ('结构化 JSON', self.export_contract_json),
++            ('截止汇总 JSON', self.export_batch_json),
++        ]:
++            self.export_menu.add_command(label=text, command=action)
++        ttk.Menubutton(exports, text='数据导出 ▾', menu=self.export_menu).pack(side='right')
++
++        filters = ttk.Frame(context)
++        filters.pack(side='right', padx=(12, 0))
++        ttk.Label(filters, text='风险筛选').pack(side='left', padx=(0, 5))
++        metric_box = ttk.Combobox(filters, textvariable=self.metric,
++                                  values=['总赔付', '净亏损'], width=7, state='readonly')
+         metric_box.pack(side='left')
+         metric_box.bind('<<ComboboxSelected>>', self.filter_changed)
+-        ttk.Label(bar, text='≥').pack(side='left', padx=5)
+-        threshold = ttk.Entry(bar, textvariable=self.threshold, width=10)
++        ttk.Label(filters, text='≥').pack(side='left', padx=(5, 3))
++        threshold = ttk.Entry(filters, textvariable=self.threshold, width=8)
+         threshold.pack(side='left')
+         threshold.bind('<KeyRelease>', self.filter_changed)
+-        ttk.Label(bar, text='元').pack(side='left', padx=5)
+-        ttk.Button(bar, text='导出截止汇总', command=self.export_batch_json).pack(side='right', padx=(6,0))
+-        ttk.Button(bar, text='导出结构化JSON', command=self.export_contract_json).pack(side='right', padx=(6,0))
+-        ttk.Button(bar, text='导出投注明细', command=self.export_detail_csv).pack(side='right', padx=(6,0))
+-        ttk.Button(bar, text='导出当前数据', command=self.export_csv).pack(side='right')
++        ttk.Label(filters, text='元').pack(side='left', padx=(4, 0))
+ 
+         metrics = ttk.Frame(self)
+-        metrics.pack(fill='x', padx=24, pady=(0, 8))
++        metrics.pack(fill='x', padx=pad, pady=(0, 8))
+         self.cards = {}
+-        for i, (name, label) in enumerate([('due', '有效投注应收'), ('income', '计入收入'), ('risk', '达到阈值的号码'), ('loss', '当前最大净亏损')]):
+-            metrics.columnconfigure(i, weight=1)
+-            card = tk.Frame(metrics, bg='white', padx=14, pady=9, bd=1, relief='solid')
++        for i, (key, label) in enumerate([
++            ('due', '有效投注应收'), ('income', '计入收入'),
++            ('risk', '达到阈值的号码'), ('loss', '当前最大净亏损'),
++        ]):
++            metrics.columnconfigure(i, weight=1, uniform='metric')
++            card = tk.Frame(metrics, bg='white', bd=1, relief='solid', padx=13, pady=8)
+             card.grid(row=0, column=i, sticky='ew', padx=(0, 8 if i < 3 else 0))
+-            tk.Label(card, text=label, fg=MUTED, bg='white').pack(anchor='w')
+-            value = tk.Label(card, text='—', bg='white', fg=RED if name == 'loss' else INK, font=('Microsoft YaHei UI', 20, 'bold'))
+-            value.pack(anchor='w', pady=(2, 0))
+-            self.cards[name] = value
+-        # 开奖区域：与选择的彩种/日期绑定；联网请求只查官方开奖公告。
+-        draw_bar = ttk.LabelFrame(self, text='今日开奖 · 当前期试算（不修改投注记录）', padding=(10, 5))
+-        draw_bar.pack(fill='x', padx=24, pady=(0, 5))
+-        draw_row = ttk.Frame(draw_bar)
+-        draw_row.pack(fill='x')
+-        ttk.Label(draw_row, text='开奖号码（百十个）').pack(side='left', padx=(0, 6))
+-        self.draw_entry = ttk.Entry(draw_row, textvariable=self.draw_number, width=8)
+-        self.draw_entry.pack(side='left', padx=(0, 8))
+-        self.draw_entry.bind('<KeyRelease>', self._draw_edited)
+-        self.draw_fetch_button = ttk.Button(draw_row, text='联网获取', command=self.lookup_draw)
+-        self.draw_fetch_button.pack(side='left', padx=(0, 6))
+-        ttk.Button(draw_row, text='计算赔付', style='Accent.TButton', command=self.calculate_draw).pack(side='left', padx=(0, 6))
+-        ttk.Button(draw_row, text='中奖明细', command=self.show_draw_details).pack(side='left', padx=(0, 6))
+-        ttk.Button(draw_row, text='正式结算', command=self.save_draw_settlement).pack(side='left')
+-        self.draw_summary_label = ttk.Label(draw_bar, text='填写三位开奖号码，或点击联网获取；试算不会写入兑奖账本。', foreground=MUTED)
+-        self.draw_summary_label.pack(anchor='w', pady=(5,0))
+-        self.draw_source_label = ttk.Label(draw_bar, text='', foreground=MUTED)
+-        self.draw_source_label.pack(anchor='w')
+-
+-        self.warning = tk.Label(self, bg=BG, fg=RED, anchor='w', justify='left')
+-        self.warning.pack(fill='x', padx=24, pady=(0,6))
+-
+-        # 主工作区固定为“投注记录在上、风险/方案在下”。
+-        # 不再使用可拖动 PanedWindow，避免小屏或内容较多时风险表被挤到看不见。
+-        body = ttk.Frame(self)
+-        body.pack(fill='both', expand=True, padx=24, pady=(0,12))
+-        body.columnconfigure(0, weight=1)
+-        body.rowconfigure(0, weight=5, minsize=300)
+-        body.rowconfigure(1, weight=4, minsize=220)
+-        records_panel = ttk.Frame(body)
+-        records_panel.grid(row=0, column=0, sticky='nsew', pady=(0,8))
+-        risk_panel = ttk.Frame(body)
+-        risk_panel.grid(row=1, column=0, sticky='nsew')
+-        risk_panel.rowconfigure(0, weight=1)
+-        risk_panel.columnconfigure(0, weight=3, minsize=620)
+-        risk_panel.columnconfigure(1, weight=2, minsize=360)
+-
+-        input_box = ttk.LabelFrame(records_panel, text='今日数据 / 手动补录', padding=8)
+-        input_box.pack(fill='x', pady=(0,8))
++            tk.Label(card, text=label, bg='white', fg=MUTED).pack(anchor='w')
++            value = tk.Label(card, text='—', bg='white',
++                             fg=RED if key == 'loss' else INK,
++                             font=('Microsoft YaHei UI', 18, 'bold'))
++            value.pack(anchor='w', pady=(1, 0))
++            self.cards[key] = value
++
++        self.warning = tk.Label(self, bg=BG, fg=RED, anchor='w', justify='left',
++                                wraplength=1040)
++        self.warning.pack(fill='x', padx=pad, pady=(0, 5))
++
++        # 连接信息不占用任务工具栏，也不与当前彩种、日期争抢空间。
++        footer = tk.Frame(self, bg='#eaf0f7', bd=1, relief='solid')
++        footer.pack(side='bottom', fill='x')
++        footer.columnconfigure(0, weight=2)
++        footer.columnconfigure(1, weight=3)
++        self.group_label = tk.Label(footer, text='', bg='#eaf0f7', fg=MUTED,
++                                    anchor='w', justify='left', wraplength=400)
++        self.group_label.grid(row=0, column=0, sticky='ew', padx=(pad, 10), pady=6)
++        self.status = tk.Label(footer, text='', bg='#eaf0f7', fg=MUTED,
++                               anchor='e', justify='right', wraplength=670)
++        self.status.grid(row=0, column=1, sticky='ew', padx=(0, pad), pady=6)
++
++        self.workspace_tabs = ttk.Notebook(self)
++        self.workspace_tabs.pack(fill='both', expand=True, padx=pad, pady=(0, 8))
++        records_page = ttk.Frame(self.workspace_tabs)
++        risks_page = ttk.Frame(self.workspace_tabs)
++        draws_page = ttk.Frame(self.workspace_tabs)
++        self.workspace_tabs.add(records_page, text='  投注管理  ')
++        self.workspace_tabs.add(risks_page, text='  实时风险  ')
++        self.workspace_tabs.add(draws_page, text='  开奖结算  ')
++
++        # 第一页：录入区固定在上，记录表独占剩余全部空间。
++        input_box = ttk.LabelFrame(records_page, text='手动补录', padding=(12, 9))
++        input_box.pack(fill='x', pady=(9, 8))
+         input_row = ttk.Frame(input_box)
+         input_row.pack(fill='x')
+-        self.input = tk.Text(input_row, height=2, wrap='word', relief='solid', bd=1, bg='white', fg=INK)
++        self.input = tk.Text(input_row, height=3, wrap='word', relief='solid', bd=1,
++                             bg='white', fg=INK)
+         self.input.pack(side='left', fill='x', expand=True)
+         self.input.bind('<Return>', self.add_event)
+         self.input.bind('<Shift-Return>', lambda event: None)
+         side = ttk.Frame(input_row)
+-        side.pack(side='right', padx=(8,0))
+-        ttk.Button(side, text='添加', style='Accent.TButton', command=self.add_manual).pack(fill='x')
+-        ttk.Label(side, text='Shift+Enter换行', foreground=MUTED).pack(pady=(4,0))
++        side.pack(side='right', padx=(10, 0))
++        ttk.Button(side, text='添加投注', style='Accent.TButton', command=self.add_manual).pack(fill='x')
++        ttk.Label(side, text='Shift+Enter 换行', foreground=MUTED).pack(pady=(6, 0))
+         receipt_row = ttk.Frame(input_box)
+-        receipt_row.pack(fill='x', pady=(6,0))
++        receipt_row.pack(fill='x', pady=(7, 0))
+         ttk.Label(receipt_row, text='已确认实收').pack(side='left')
+         ttk.Entry(receipt_row, textvariable=self.receipt, width=10).pack(side='left', padx=6)
+         ttk.Label(receipt_row, text='元（留空按应收）').pack(side='left')
+-        ttk.Label(receipt_row, text='示例：358421组六10倍，293单组各50倍', foreground=MUTED).pack(side='right')
++        ttk.Label(receipt_row, text='例：358421组六10倍，293单组各50倍',
++                  foreground=MUTED).pack(side='right')
+         self.add_feedback = ttk.Label(input_box, text='', foreground='#167647')
+-        self.add_feedback.pack(fill='x', anchor='w', pady=(4,0))
++        self.add_feedback.pack(fill='x', anchor='w', pady=(4, 0))
+ 
+-        notebook = ttk.Notebook(records_panel)
++        notebook = ttk.Notebook(records_page)
+         notebook.pack(fill='both', expand=True)
+         records_tab, guide_tab = ttk.Frame(notebook), ttk.Frame(notebook)
+         notebook.add(records_tab, text='投注记录')
+@@ -531,47 +551,171 @@
+         records_tab.rowconfigure(1, weight=1)
+         records_tab.columnconfigure(0, weight=1)
+         self.records_summary = ttk.Label(records_tab, text='今日0条 · 已识别0 · 未识别0 · 已选0')
+-        self.records_summary.grid(row=0,column=0,sticky='ew',pady=(6,4))
+-        self.records_tree = RecordTable(records_tab, [('time','时间',75),('source','来源',70),('raw','投注原文',420),('amount','应收',75),('status','状态',95)])
+-        self.records_tree.grid(row=1,column=0,sticky='nsew')
++        self.records_summary.grid(row=0, column=0, sticky='ew', pady=(7, 5))
++        self.records_tree = RecordTable(records_tab, [
++            ('time', '时间', 75), ('source', '来源', 70), ('raw', '投注原文', 420),
++            ('amount', '应收', 75), ('status', '状态', 95),
++        ])
++        self.records_tree.grid(row=1, column=0, sticky='nsew')
+         self.records_tree.tag_configure('pending', foreground=RED)
+         self.records_tree.bind('<Button-3>', self.record_context_menu)
+         self.records_tree.on_selection_change = self._update_record_selection_count
+         actions = ttk.Frame(records_tab)
+-        actions.grid(row=2,column=0,sticky='ew',pady=6)
+-        for title, command in [('查看', self.view_record), ('修改／实收', self.edit_record), ('重新识别', self.reparse_selected), ('AI转换', self.ai_selected), ('删除', self.delete_selected)]:
+-            ttk.Button(actions, text=title, command=command).pack(side='left', padx=(0,4))
+-        ttk.Label(actions, text='单击复选框或双击数据行选择；右键可全选、反选、删除当前数据', foreground=MUTED).pack(side='right')
++        actions.grid(row=2, column=0, sticky='ew', pady=(7, 3))
++        for title, command in [
++            ('查看', self.view_record), ('修改／实收', self.edit_record),
++            ('重新识别', self.reparse_selected), ('AI转换', self.ai_selected),
++            ('删除', self.delete_selected),
++        ]:
++            ttk.Button(actions, text=title, command=command).pack(side='left', padx=(0, 6))
++        ttk.Label(records_tab, text='单击复选框或双击行选中；右键可全选、反选和删除当前数据',
++                  foreground=MUTED).grid(row=3, column=0, sticky='w', pady=(1, 3))
+         guide = tk.Text(guide_tab, wrap='word', bg='white', relief='solid', bd=1)
+         guide.pack(fill='both', expand=True, padx=2, pady=6)
+         guide.insert('1.0', self.template_text())
+         guide.configure(state='disabled')
+ 
+-        # 风险表和处理方案并排显示。这样即使窗口高度较低，风险表也不会被方案区挤没。
+-        risk_box = ttk.LabelFrame(risk_panel, text='实时风险 · 点击号码查看来源', padding=8)
+-        risk_box.grid(row=0, column=0, sticky='nsew', padx=(0,8))
+-        risk_box.rowconfigure(0, weight=1, minsize=135)
++        # 第二页：风险表和处理方案拥有整屏高度，无需与投注表分高度。
++        risk_panel = ttk.Frame(risks_page)
++        risk_panel.pack(fill='both', expand=True, pady=(9, 0))
++        risk_panel.rowconfigure(0, weight=1)
++        risk_panel.columnconfigure(0, weight=3, minsize=525)
++        risk_panel.columnconfigure(1, weight=2, minsize=295)
++        risk_box = ttk.LabelFrame(risk_panel, text='实时风险 · 点击开奖号码查看赔付来源', padding=8)
++        risk_box.grid(row=0, column=0, sticky='nsew', padx=(0, 9))
++        risk_box.rowconfigure(0, weight=1)
+         risk_box.columnconfigure(0, weight=1)
+-        self.risks_tree = RiskGridTable(risk_box, [('number','号码',70),('payout','总赔付',110),('income','计入收入',100),('loss','净亏损',110),('plan','处理倍数',95)])
+-        self.risks_tree.grid(row=0,column=0,sticky='nsew')
++        self.risks_tree = RiskGridTable(risk_box, [
++            ('number', '号码', 70), ('payout', '总赔付', 110),
++            ('income', '计入收入', 100), ('loss', '净亏损', 110), ('plan', '处理倍数', 95),
++        ])
++        self.risks_tree.grid(row=0, column=0, sticky='nsew')
+         self.risks_tree.bind('<<TreeviewSelect>>', self.show_sources)
+-        self.sources = tk.Text(risk_box, height=2, wrap='word', bg='#f7f9fd', relief='solid', bd=1, fg=MUTED)
+-        self.sources.grid(row=1,column=0,sticky='ew',pady=(6,0))
++        self.sources = tk.Text(risk_box, height=4, wrap='word', bg='#f7f9fd',
++                               relief='solid', bd=1, fg=MUTED)
++        self.sources.grid(row=1, column=0, sticky='ew', pady=(7, 0))
+         self.set_text(self.sources, '选择号码，可查看产生赔付的投注、发送人和原文。')
+ 
+-        plan_box = ttk.LabelFrame(risk_panel, text='当前处理方案', padding=8)
++        plan_box = ttk.LabelFrame(risk_panel, text='当前处理方案', padding=10)
+         plan_box.grid(row=0, column=1, sticky='nsew')
+         plan_box.rowconfigure(0, weight=1)
+         plan_box.columnconfigure(0, weight=1)
+-        self.plan = tk.Text(plan_box, height=6, wrap='word', bg='white', relief='solid', bd=1, fg=INK, font=('Microsoft YaHei UI', 11))
++        self.plan = tk.Text(plan_box, height=10, wrap='word', bg='white',
++                            relief='solid', bd=1, fg=INK,
++                            font=('Microsoft YaHei UI', 11))
+         self.plan.grid(row=0, column=0, sticky='nsew')
+-        row = ttk.Frame(plan_box)
+-        row.grid(row=1, column=0, sticky='ew', pady=(6,0))
+-        self.plan_note = ttk.Label(row, text='')
++        plan_row = ttk.Frame(plan_box)
++        plan_row.grid(row=1, column=0, sticky='ew', pady=(8, 0))
++        self.plan_note = ttk.Label(plan_row, text='')
+         self.plan_note.pack(side='left')
+-        self.copy_button = ttk.Button(row, text='一键复制', style='Accent.TButton', command=self.copy_plan)
++        self.copy_button = ttk.Button(plan_row, text='一键复制',
++                                      style='Accent.TButton', command=self.copy_plan)
+         self.copy_button.pack(side='right')
+ 
++        # 第三页：独立纵向滚动；1366×768等小屏也能看到中奖明细和完整结算操作。
++        draw_host = draws_page
++        draw_canvas = tk.Canvas(draw_host, bg=BG, bd=0, highlightthickness=0)
++        draw_scroll = ttk.Scrollbar(draw_host, orient='vertical', command=draw_canvas.yview)
++        draw_canvas.configure(yscrollcommand=draw_scroll.set)
++        draw_scroll.pack(side='right', fill='y')
++        draw_canvas.pack(side='left', fill='both', expand=True)
++        draws_page = ttk.Frame(draw_canvas)
++        draw_window = draw_canvas.create_window((0, 0), anchor='nw', window=draws_page)
++        self.draw_canvas = draw_canvas
++        def update_draw_scroll(event=None):
++            draw_canvas.configure(scrollregion=draw_canvas.bbox('all'))
++        def fit_draw_width(event):
++            draw_canvas.itemconfigure(draw_window, width=event.width)
++        def scroll_draw(event):
++            if event.delta:
++                draw_canvas.yview_scroll(int(-event.delta / 120), 'units')
++            return 'break'
++        draws_page.bind('<Configure>', update_draw_scroll)
++        draw_canvas.bind('<Configure>', fit_draw_width)
++        draw_canvas.bind('<MouseWheel>', scroll_draw)
++        draws_page.bind('<MouseWheel>', scroll_draw)
++        # 左侧输入/核验操作，右侧金额结果；任何错误都可换行显示。
++        draws_page.columnconfigure(0, weight=4, uniform='draw')
++        draws_page.columnconfigure(1, weight=5, uniform='draw')
++        draws_page.rowconfigure(1, weight=1)
++        intro = ttk.Frame(draws_page)
++        intro.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(15, 10))
++        ttk.Label(intro, text='当前期开奖号码与赔付试算',
++                  font=('Microsoft YaHei UI', 14, 'bold')).pack(anchor='w')
++        ttk.Label(intro, text='跟随顶部选定彩种与日期。试算不改变投注和兑奖记录；正式结算需完成封盘。',
++                  foreground=MUTED).pack(anchor='w', pady=(4, 0))
++
++        draw_input = ttk.LabelFrame(draws_page, text='01  开奖号码', padding=15)
++        draw_input.grid(row=1, column=0, sticky='nsew', padx=(0, 10), pady=(0, 12))
++        ttk.Label(draw_input, text='按百位、十位、个位输入三位数字', foreground=MUTED).pack(anchor='w')
++        entry_row = ttk.Frame(draw_input)
++        entry_row.pack(fill='x', pady=(9, 10))
++        self.draw_entry = ttk.Entry(entry_row, textvariable=self.draw_number, width=8,
++                                    font=('Consolas', 24, 'bold'), justify='center')
++        self.draw_entry.pack(side='left')
++        self.draw_entry.bind('<KeyRelease>', self._draw_edited)
++        self.draw_fetch_button = ttk.Button(entry_row, text='联网获取', command=self.lookup_draw)
++        self.draw_fetch_button.pack(side='left', padx=(13, 0))
++        ttk.Button(draw_input, text='计算应赔金额', style='Accent.TButton',
++                   command=self.calculate_draw).pack(fill='x', pady=(0, 9))
++        action_row = ttk.Frame(draw_input)
++        action_row.pack(fill='x')
++        ttk.Button(action_row, text='中奖明细', command=self.show_draw_details).pack(side='left', fill='x', expand=True, padx=(0, 5))
++        ttk.Button(action_row, text='正式结算', command=self.save_draw_settlement).pack(side='left', fill='x', expand=True, padx=(5, 0))
++        ttk.Separator(draw_input).pack(fill='x', pady=(15, 12))
++        ttk.Label(draw_input, text='数据来源与联网核验',
++                  font=('Microsoft YaHei UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
++        self.draw_source_label = ttk.Label(draw_input, text='', foreground=MUTED,
++                                            justify='left', wraplength=375)
++        self.draw_source_label.pack(fill='x', anchor='w')
++        ttk.Label(draw_input, text='若官网尚未公布，可手动输入并先试算；联网失败不会清空已输入号码。',
++                  foreground=MUTED, wraplength=375).pack(anchor='w', pady=(14, 0))
++
++        draw_result = ttk.LabelFrame(draws_page, text='02  赔付结果', padding=15)
++        draw_result.grid(row=1, column=1, sticky='nsew', pady=(0, 12))
++        draw_result.columnconfigure(0, weight=1, uniform='draw-result')
++        draw_result.columnconfigure(1, weight=1, uniform='draw-result')
++        self.draw_cards = {}
++        for i, (key, title) in enumerate([
++            ('income', '计入收入'), ('payout', '应赔金额'),
++            ('net', '当期净盈亏'), ('count', '中奖明细'),
++        ]):
++            row, col = divmod(i, 2)
++            panel = tk.Frame(draw_result, bg='white', bd=1, relief='solid', padx=12, pady=14)
++            panel.grid(row=row, column=col, sticky='nsew', padx=(0, 8 if col == 0 else 0), pady=(0, 8))
++            tk.Label(panel, text=title, bg='white', fg=MUTED).pack(anchor='w')
++            value = tk.Label(panel, text='—', bg='white', fg=RED if key == 'payout' else INK,
++                             font=('Microsoft YaHei UI', 20, 'bold'))
++            value.pack(anchor='w', pady=(8, 0))
++            self.draw_cards[key] = value
++        ttk.Label(draw_result, text='试算说明 / 待核对事项',
++                  font=('Microsoft YaHei UI', 10, 'bold')).grid(
++                      row=2, column=0, columnspan=2, sticky='w', pady=(12, 5))
++        self.draw_summary_label = ttk.Label(draw_result,
++            text='填写三位开奖号码，或点击联网获取；试算不会写入兑奖账本。',
++            foreground=MUTED, wraplength=440, justify='left')
++        self.draw_summary_label.grid(row=3, column=0, columnspan=2, sticky='ew')
++        ttk.Label(draw_result, text='本期命中投注（完整明细仍可点击左侧「中奖明细」）',
++                  font=('Microsoft YaHei UI', 10, 'bold')).grid(
++                      row=4, column=0, columnspan=2, sticky='w', pady=(13, 5))
++        winners_box = ttk.Frame(draw_result)
++        winners_box.grid(row=5, column=0, columnspan=2, sticky='nsew')
++        winners_box.rowconfigure(0, weight=1)
++        winners_box.columnconfigure(0, weight=1)
++        self.draw_winners = ttk.Treeview(winners_box, columns=('play', 'selection', 'multiplier', 'payout'),
++                                          show='headings', selectmode='browse', height=6)
++        for key, title, width in [('play','玩法',120),('selection','投注号码',115),
++                                   ('multiplier','倍数',65),('payout','应赔金额',100)]:
++            self.draw_winners.heading(key, text=title)
++            self.draw_winners.column(key, width=width, minwidth=55, stretch=(key in ('play','selection')))
++        self.draw_winners.grid(row=0, column=0, sticky='nsew')
++        win_scroll = ttk.Scrollbar(winners_box, orient='vertical', command=self.draw_winners.yview)
++        win_scroll.grid(row=0, column=1, sticky='ns')
++        self.draw_winners.configure(yscrollcommand=win_scroll.set)
++        ttk.Label(draw_result, text='只展示已经通过本地校验的命中记录；未识别投注须另外核对。',
++                  foreground=MUTED, wraplength=460).grid(row=6, column=0, columnspan=2,
++                                                           sticky='w', pady=(5, 0))
++        draw_result.rowconfigure(5, weight=1)
+     @staticmethod
+     def tree(parent, columns):
+         box = ttk.Frame(parent)
+@@ -691,7 +835,10 @@
+         self._draw_online = None
+         self._draw_preview = None
+         self.draw_number.set('')
+-        self.draw_summary_label.configure(text='填写三位开奖号码，或点击联网获取；试算不会写入兑奖账本。')
++        self.draw_winners.delete(*self.draw_winners.get_children())
++        for label in self.draw_cards.values():
++            label.configure(text='—')
++        self.draw_summary_label.configure(text='填写三位开奖号码，或点击联网获取；试算不会写入兑奖账本。', foreground=MUTED)
+         saved = self.store.load_settlement(context[1], context[0])
+         if saved:
+             self.draw_source_label.configure(text=f'本期已有正式结算：{saved["draw"]}，应赔 {saved["total_payout_yuan"]:g} 元（不可覆盖）')
+@@ -701,7 +848,10 @@
+     def _draw_edited(self, event=None):
+         self._draw_online = None
+         self._draw_preview = None
+-        self.draw_summary_label.configure(text='已修改开奖号码，点击“计算赔付”重新试算。')
++        self.draw_winners.delete(*self.draw_winners.get_children())
++        for label in self.draw_cards.values():
++            label.configure(text='—')
++        self.draw_summary_label.configure(text='已修改开奖号码，点击“计算赔付”重新试算。', foreground=MUTED)
+         self.draw_source_label.configure(text='当前号码来源：手动输入')
+ 
+     def lookup_draw(self):
+@@ -750,6 +900,15 @@
+             return
+         self._draw_preview = preview
+         net = preview['net_income_yuan']
++        self.draw_cards['income'].configure(text=f'{preview["income_yuan"]:g}元')
++        self.draw_cards['payout'].configure(text=f'{preview["payout_yuan"]:g}元')
++        self.draw_cards['net'].configure(text=('+' if net >= 0 else '-') + f'{abs(net):g}元',
++                                          fg='#167647' if net >= 0 else RED)
++        self.draw_cards['count'].configure(text=f'{preview["winning_count"]}笔')
++        self.draw_winners.delete(*self.draw_winners.get_children())
++        for item in preview['lines']:
++            self.draw_winners.insert('', 'end', values=(
++                item['play'], item['selection'], item['multiplier'], f'{item["payout_yuan"]:g}元'))
+         self.draw_summary_label.configure(text=(
+             f'计入收入 {preview["income_yuan"]:g}元 · 应赔 {preview["payout_yuan"]:g}元 · '
+             f'净{("盈利" if net >= 0 else "亏损")} {abs(net):g}元 · '
+@@ -1524,8 +1683,8 @@
+             pages[title] = page
+             return page
+ 
+-        for title in ['计算规则', '赔率表', 'AI', '微信群', '自定义写法']:
+-            if title in {'计算规则', 'AI', '微信群'}:
++        for title in ['微信监听', 'AI识别', '计算规则', '赔率表', '自动封盘', '自定义写法', '数据管理']:
++            if title in {'计算规则', 'AI识别', '微信监听'}:
+                 make_scrollable_page(title)
+             else:
+                 page = ttk.Frame(notebook, padding=12)
+@@ -1552,9 +1711,16 @@
+         cost_mode = tk.BooleanVar(value=settings['include_hedge_cost'])
+         ttk.Checkbutton(general, text='计入全部补单成本后计算倍数', variable=cost_mode).pack(anchor='w', pady=8)
+         deadline_enabled = tk.BooleanVar(value=bool(settings.get('deadline', {}).get('enabled', False)))
+-        ttk.Checkbutton(general, text='启用每日21:14自动封盘（北京时间）', variable=deadline_enabled).pack(anchor='w', pady=(10, 4))
+-        ttk.Label(general, text='默认关闭：可全天测试本地识别、微信消息及AI。勾选并保存后，21:14停止接收当天新单并保存截止快照；21:15为统计完成目标。已生成的旧快照不会自动删除。',
+-                  wraplength=720, foreground=MUTED).pack(anchor='w', pady=(0, 8))
++        deadline_page = pages['自动封盘']
++        ttk.Label(deadline_page, text='每日封盘规则', font=('Microsoft YaHei UI', 13, 'bold')).pack(anchor='w', pady=(3, 12))
++        ttk.Checkbutton(deadline_page, text='启用每日21:14自动封盘（北京时间）',
++                        variable=deadline_enabled).pack(anchor='w', pady=(0, 12))
++        ttk.Label(deadline_page,
++                  text='默认关闭：不限制测试和正常识别。勾选保存后，当天北京时间21:14开始拒收新单并冻结快照，21:15为汇总完成目标。',
++                  wraplength=690, foreground=MUTED, justify='left').pack(anchor='w', pady=(0, 10))
++        ttk.Label(deadline_page,
++                  text='关闭开关不会删除已经生成的旧快照；过去已经正式结算的记录也不会被覆盖。',
++                  wraplength=690, foreground=RED, justify='left').pack(anchor='w')
+         ttk.Label(general, text='定位收费已固定：一码定位每个展开数字1倍10元；两码定位每个展开组合1倍10元；三码定位每个展开组合1倍2元。',
+                   wraplength=720).pack(anchor='w', pady=(10, 3))
+         ttk.Label(general, text='豹子开出：独胆、定位、单独豹子和跨度0照常中奖；对应直选默认1600元/倍，单独豹子1600元/倍、跨度0为800元/倍。其余玩法全杀。', wraplength=720).pack(anchor='w', pady=14)
+@@ -1609,7 +1775,7 @@
+             ttk.Button(edit, text='确定', command=set_rule).pack(pady=10)
+         rule_tree.bind('<Double-1>', edit_rule)
+         refresh_rules()
+-        ai_page = pages['AI']
++        ai_page = pages['AI识别']
+         ttk.Label(ai_page, text='只发送无法识别的原文。AI结果通过程序校验后自动计入，金额由程序计算。').pack(anchor='w', pady=(0, 10))
+         api_format = tk.StringVar(value='GPT文档格式（prompt）' if settings['ai'].get('api_format')=='completions' else 'Chat格式（messages）')
+         ttk.Combobox(ai_page, textvariable=api_format, values=['GPT文档格式（prompt）','Chat格式（messages）'], state='readonly', width=32).pack(anchor='w', pady=(0, 8))
+@@ -1735,7 +1901,7 @@
+             start_button.pack(side='left')
+ 
+         ttk.Button(ai_page, text='诊断连接与发送请求', command=show_ai_diagnostics).pack(anchor='w', pady=(6, 0))
+-        wechat_page = pages['微信群']
++        wechat_page = pages['微信监听']
+         ttk.Label(wechat_page, text='推荐“微信4.x本地监听”：设置页只负责配置。请先在主页面开启微信监听，读取到群列表后再回来选择福彩/体彩群。正常监听只接新消息；历史消息请在主页面手动读取。', wraplength=720).pack(anchor='w', pady=(0, 8))
+         backend_names = {'wechat4':'微信4.x本地监听（推荐）','bridge':'本机消息桥接','wcf':'WCF采集服务'}
+         backend = tk.StringVar(value=backend_names.get(settings['wechat'].get('backend'),'微信4.x本地监听（推荐）'))
+@@ -1835,6 +2001,18 @@
+             self.clipboard_append(f'POST http://127.0.0.1:{fields["bridge_port"].get()}/message\nAuthorization: Bearer {self.wechat.token}')
+             receiver_label.configure(text='接收地址和本次认证令牌已复制。更改端口请保存后重启接收。')
+         ttk.Button(wechat_page, text='复制桥接接收地址与认证', command=copy_bridge).pack(anchor='w')
++        data_page = pages['数据管理']
++        ttk.Label(data_page, text='数据导出与备份', font=('Microsoft YaHei UI', 13, 'bold')).pack(anchor='w', pady=(4, 8))
++        ttk.Label(data_page, text='导出操作与主页面顶部「数据导出」相同，不会清空或改写投注记录。',
++                  foreground=MUTED, wraplength=700).pack(anchor='w', pady=(0, 12))
++        for title, action in [('导出当前数据 CSV', self.export_csv),
++                              ('导出逐笔明细 CSV', self.export_detail_csv),
++                              ('导出结构化 JSON', self.export_contract_json),
++                              ('导出截止汇总 JSON', self.export_batch_json)]:
++            ttk.Button(data_page, text=title, command=action).pack(anchor='w', fill='x', pady=4)
++        ttk.Separator(data_page).pack(fill='x', pady=(15, 11))
++        ttk.Label(data_page, text='数据保护提醒：升级界面不需要替换或删除 data 文件夹；建议在测试环境中验收。',
++                  foreground=MUTED, wraplength=690, justify='left').pack(anchor='w')
+         alias_page = pages['自定义写法']
+         ttk.Label(alias_page, text='每行：原写法 => 标准投注。按整条原文匹配，不会随意替换数字。').pack(anchor='w', pady=(0, 6))
+         example = (
