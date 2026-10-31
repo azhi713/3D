@@ -137,3 +137,11 @@ def validate_evidence(source,candidate,bets,parser=None,lottery='福彩'):
     if not complete:
         return False,'AI未能为原文所有疑难内容提供可验证的投注依据'
     return True,''
+
+# V257-20261031-source-evidence-hotfix
+_legacy_validate_evidence = validate_evidence
+def validate_evidence(source,candidate,bets,parser=None,lottery="福彩"):
+    if isinstance(candidate,str) and candidate.lstrip().startswith("{"):
+        from evidence_v257 import validate_full
+        return validate_full(source,bets)
+    return _legacy_validate_evidence(source,candidate,bets,parser,lottery)

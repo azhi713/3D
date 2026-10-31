@@ -154,6 +154,13 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        from parser_v257 import parse_common_v257
+        try:
+            common = parse_common_v257(self, lottery, text)
+        except (ValueError, KeyError, ArithmeticError) as exc:
+            return [], self.normalize_text(text), str(exc)
+        if common is not None:
+            return common
         from semantic import parse_message,SemanticError,requires_semantic
         base=self._parse_pipeline(lottery,text)
         metadata=(self.last_claimed,list(self.last_receipts),list(self.last_warnings))
@@ -867,3 +874,5 @@ class BetParser:
         else:
             play = kind
         return [self._make(lottery, raw, play, selection, mult)]
+
+# V257-20261031-source-evidence-hotfix

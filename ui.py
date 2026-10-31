@@ -98,8 +98,8 @@ class RecordTable(tk.Frame):
         return 'break'
 
     def _schedule_layout(self,event=None):
-        if not getattr(self.winfo_toplevel(),'_closing',False):
-            self._layout_rows()
+        if not getattr(self.winfo_toplevel(),'_closing',False) and not self._layout_timer:
+            self._layout_timer=self.after_idle(self._layout_rows)
 
     def _layout_rows(self):
         if self._layout_timer:
@@ -114,6 +114,12 @@ class RecordTable(tk.Frame):
             row['top']=top;row['height']=height
             top+=height
         self.canvas.configure(scrollregion=(0,0,width,top))
+        anchor=getattr(self,'_pending_anchor',None)
+        self._pending_anchor=None
+        if anchor:
+            iid,offset,old_top=anchor
+            target=(self._rows[iid]['top']+offset) if iid in self._rows else old_top
+            self.canvas.yview_moveto(max(0,target)/max(1,top))
 
     def destroy(self):
         if self._layout_timer:
@@ -300,14 +306,11 @@ class RecordTable(tk.Frame):
             self._rows={iid:self._rows[iid] for iid in desired}
             counts['move']=len(desired)
         if any(counts.values()):
-            self._layout_rows()
-            self.update_idletasks()
-            bounds=self.canvas.bbox('all') or (0,0,0,0)
-            self.canvas.configure(scrollregion=bounds)
-            if self._rows and anchor in self._rows:
-                target=self._rows[anchor]['top']+offset
-                self.canvas.yview_moveto(max(0,target)/max(1,bounds[3]))
-            elif not self._rows:self.canvas.yview_moveto(0)
+            # No synchronous update_idletasks: it triggered visible redraw
+            # between every AI status transition. Coalesce canvas geometry.
+            self._pending_anchor=(anchor,offset,top) if self._rows else None
+            self._schedule_layout()
+            if not self._rows:self.canvas.yview_moveto(0)
         self.last_diff=counts
         return counts
 
@@ -904,13 +907,11 @@ class RiskApp(tk.Tk):
         self._risk_key = signature
         self._risk_generation += 1
         generation = self._risk_generation
-        if len(records) < 200:
-            self._apply_risk_snapshot(self.controller.calculate_analysis(inputs))
-        else:
-            self.copy_button.configure(state='disabled')
-            self.warning.configure(text='风险正在重新计算，当前显示为上次结果。',fg=RED)
-            self._risk_next = (generation,inputs)
-            self._start_risk_job()
+        # Always calculate 1000 outcomes on the worker, including small lists;
+        # a Tk callback must never do synchronous risk enumeration.
+        self.copy_button.configure(state='disabled')
+        self._risk_next = (generation,inputs)
+        self._start_risk_job()
         self.update_status()
 
     def _start_risk_job(self):
@@ -1760,7 +1761,7 @@ class RiskApp(tk.Tk):
                             self.store.update(latest, '截止拦截AI结果')
                         if latest and latest.revision != revision:
                             self.queue_ai(latest)
-                        elif latest and not was_manual and self._retry_invalid_ai_once(record_id):
+                        elif latest and not was_manual and self.controller.settings['ai'].get('auto_retry_invalid',False) and self._retry_invalid_ai_once(record_id):
                             # 只自动再试一次；不让失败候选在程序重启后反复扣费。
                             dirty = True
                     dirty = True
@@ -2610,3 +2611,5 @@ class RiskApp(tk.Tk):
             self.tk.call('after','cancel',timer)
         self.store.close()
         self.destroy()
+
+# V257-20261031-source-evidence-hotfix

@@ -237,7 +237,7 @@ class AIService:
                     request_data=context
             except ValueError:
                 pass
-        obj = self._request([{'role': 'system', 'content': (self.config.get('prompt') or DEFAULT_AI_PROMPT).strip()},
+        obj = self._request([{'role': 'system', 'content': ((self.config.get('prompt') or DEFAULT_AI_PROMPT).strip() + '\nV2.5.7接口优先：candidate_bets逐笔填写segment_id(如S1)、bet_type、''ticket_codes或digit_set、amount_kind、bet_multiples或declared_amount_yuan；''source_start/source_end/evidence_text可以省略，由程序按segment_id定位；''不要重复local_confirmed；不能确定则needs_review=true。')},
                              {'role': 'user', 'content': json.dumps(request_data, ensure_ascii=False)}])
         if isinstance(obj.get('candidate_bets'),list) and obj['candidate_bets']:
             return json.dumps(obj,ensure_ascii=False),str(obj.get('brief_reason',''))[:200]
@@ -248,3 +248,5 @@ class AIService:
             raise AIError('AI已返回但无法确认投注：'+reason+'；原始数据已保存')
         self._log('AI转换文本已生成', output_char_count=len(obj['standard_text'].strip()))
         return obj['standard_text'].strip(), str(obj.get('reason', ''))[:200]
+
+# V257-20261031-source-evidence-hotfix

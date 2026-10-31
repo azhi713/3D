@@ -77,3 +77,6 @@ def decode_candidate(candidate,parser,lottery,source):
         return bets,candidate,''
     except (ValueError,TypeError,KeyError,ArithmeticError) as exc:
         return [],candidate,str(exc)
+
+# V257-20261031-source-evidence-hotfix
+from candidate_v257 import decode_candidate_v257 as decode_candidate
