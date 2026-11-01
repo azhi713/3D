@@ -237,8 +237,22 @@ class AIService:
                     request_data=context
             except ValueError:
                 pass
-        obj = self._request([{'role': 'system', 'content': ((self.config.get('prompt') or DEFAULT_AI_PROMPT).strip() + '\nV2.5.7接口优先：candidate_bets逐笔填写segment_id(如S1)、bet_type、''ticket_codes或digit_set、amount_kind、bet_multiples或declared_amount_yuan；''source_start/source_end/evidence_text可以省略，由程序按segment_id定位；''不要重复local_confirmed；不能确定则needs_review=true。')},
-                             {'role': 'user', 'content': json.dumps(request_data, ensure_ascii=False)}])
+        instructions=(self.config.get('prompt') or DEFAULT_AI_PROMPT).strip()
+        instructions += '\n' + 'V2.5.7双字段协议：candidate_bets每笔返回segment_id、bet_type、ticket_codes或digit_set或position_sets、declared_amount_yuan和bet_multiples两个独立字段；没有明示倍数写null。元米块是金额，倍是倍数。无单位数字只有合计能唯一核对时可解释为金额。四码及以上组选包码输出四码组六/四码组三等，除非原文明示复式。不计算投注本金或倍数；不要重复local_confirmed。只输出JSON对象。'
+        # V257-RECEIPT-FOLLOWUP-20261101: deterministic receipt-backed candidates first.
+        # Still validated by the normal period-specific candidate pipeline.
+        from receipt_inference_v257 import infer_receipt_candidates
+        inferred = infer_receipt_candidates(request_data)
+        if inferred is not None:
+            self._timing_local.metrics = {
+                'api_total_s': 0.0, 'response_s': 0.0, 'json_s': 0.0,
+                'transport_stage': 'local_receipt', 'billing_state': 'not_sent',
+            }
+            self._log('本地合计候选已生成，等待完整投注校验',
+                      candidate_count=len(inferred['candidate_bets']))
+            return json.dumps(inferred, ensure_ascii=False), '按原文合计生成候选，仍须程序校验'
+        obj=self._request([{'role':'system','content':instructions},
+                           {'role':'user','content':json.dumps(request_data,ensure_ascii=False)}])
         if isinstance(obj.get('candidate_bets'),list) and obj['candidate_bets']:
             return json.dumps(obj,ensure_ascii=False),str(obj.get('brief_reason',''))[:200]
         if obj.get('uncertain') is not False or not isinstance(obj.get('standard_text'), str) or not obj['standard_text'].strip():
@@ -250,3 +264,5 @@ class AIService:
         return obj['standard_text'].strip(), str(obj.get('reason', ''))[:200]
 
 # V257-20261031-source-evidence-hotfix
+
+# V257-AI-AMOUNT-20261101

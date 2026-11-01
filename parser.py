@@ -154,6 +154,10 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        from recognition_v258 import parse_unambiguous
+        deterministic = parse_unambiguous(self, lottery, text)
+        if deterministic is not None:
+            return deterministic
         from parser_v257 import parse_common_v257
         try:
             common = parse_common_v257(self, lottery, text)
@@ -876,3 +880,5 @@ class BetParser:
         return [self._make(lottery, raw, play, selection, mult)]
 
 # V257-20261031-source-evidence-hotfix
+
+# V258-LOCAL-RECOGNIZER-20261101

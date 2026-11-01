@@ -279,6 +279,7 @@ class Controller:
                            'source_segments':segments,'unresolved_segments':scoped,
                            'local_confirmed':confirmed,
                            'local_confirmed_count':len(record.bets),
+                           'local_confirmed_amount_yuan':sum(cents(b.principal) for b in record.bets)/100,
                            'instruction':'只解释未确定投注；使用程序提供的segment_id。'
                                          '不用计算字符偏移；勿重复已确认投注；金额/倍数必须区分。'},
                           ensure_ascii=False)
@@ -843,3 +844,5 @@ class Controller:
         return added, errors
 
 # V257-20261031-source-evidence-hotfix
+
+# V257-RECEIPT-FOLLOWUP-20261101
