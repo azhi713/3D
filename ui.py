@@ -956,7 +956,13 @@ class RiskApp(ShortcutMixin, tk.Tk):
             visual_status=('本地识别中' if record.ai_request_state=='local_running' else
                            'AI排队中' if record.ai_request_state=='queued' and record.status=='AI识别中' else record.status)
             if record.parse_status=='amount_mismatch':
-                amount='—';visual_status='金额异常·待确认'
+                estimate=record.computed_amount_yuan
+                amount=(f'{estimate:g}（暂算）' if estimate is not None and estimate>0 else '—')
+                visual_status='金额异常·待确认'
+            elif any(item.get('code')=='untyped_tail_ambiguous' for item in record.issues):
+                estimate=record.computed_amount_yuan
+                amount=(f'{estimate:g}（待核）' if estimate is not None and estimate>0 else '—')
+                visual_status='尾数待核对'
             rows.append((record.record_id,(record.created_at[11:19], record.source, record.raw_text, amount, visual_status),
                          ('processing',) if record.ai_request_state=='local_running' or record.status=='AI识别中' else
                          () if record.status == '已识别' else ('pending',)))
@@ -1499,6 +1505,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
             lines.extend(f"[{item['start']}:{item['end']}] {item['text']}：{item['reason']}" for item in record.pending_fragments)
         if record.ai_candidate:
             lines.append('\nAI转换：'+record.ai_candidate)
+        if record.computed_amount_yuan is not None:
+            lines.append(f'\n程序核算应收：{record.computed_amount_yuan:g}元' +
+                         ('（金额待核对，未计入风险）' if record.parse_status=='amount_mismatch' else ''))
+        if record.claimed_amount is not None:
+            lines.append(f'客户自报金额：{record.claimed_amount:g}元')
         lines.append('\n逐笔明细：')
         lines.extend(f'{b.selection} {b.play} {b.multiplier}倍，应收{b.principal:g}元' for b in record.bets)
         lines.append('AI任务状态：'+({'queued':'AI排队中','started':'AI识别中','responded':'AI已返回','failed':'识别失败','unknown_billing':'网络超时，计费不明'}.get(record.ai_request_state,'未运行')))
@@ -1508,10 +1519,19 @@ class RiskApp(ShortcutMixin, tk.Tk):
             lines.append('\n最近一次AI耗时：')
             if t.get('transport_used'):lines.append('实际请求方式：'+str(t['transport_used']))
             if t.get('transport_attempts'):lines.append('请求尝试：'+', '.join(t['transport_attempts']))
-            for key,label in (('queue_s','排队'),('api_total_s','接口'),('verification_s','本地校验'),('total_s','总耗时')):
+            if timed['timings'].get('retry_attempts',1)>1:
+                lines.append(f"接口尝试：{timed['timings']['retry_attempts']}次（仅安全失败才自动重试）")
+            for key,label in (('queue_s','排队'),('api_total_s','接口累计'),('verification_s','本地校验'),('total_s','总耗时')):
                 if isinstance(t.get(key),(int,float)):
                     lines.append(f'{label}：{t[key]:.1f}秒')
-        lines.append('确认实收：'+('未填写，按应收计入收入' if record.received_amount is None else f'{record.received_amount:g}元'))
+        if record.received_amount is None:
+            receipt_message=('未填写；金额待核对，暂不计入收入' if record.parse_status=='amount_mismatch' or
+                             any(i.get('code')=='untyped_tail_ambiguous' for i in record.issues) else
+                             '未填写；仅已验证部分按应收计入' if record.status=='部分识别' else
+                             '未填写，按应收计入收入')
+        else:
+            receipt_message=f'{record.received_amount:g}元（已登记，非到账证明）'
+        lines.append('确认实收：'+receipt_message)
         self.set_text(text, '\n'.join(lines))
 
     def edit_record(self):
@@ -1784,14 +1804,19 @@ class RiskApp(ShortcutMixin, tk.Tk):
             timings={'queue_s':perf_counter()-queued_at,'retry_count':1 if retry_feedback else 0}
             self.events.put(('ai_started',record.record_id,revision))
             try:
-                candidate, reason = service.parse_unknown(record.lottery, ai_text)
+                from ai_retry_v265 import parse_with_safe_retry
+                candidate, reason = parse_with_safe_retry(service, record.lottery, ai_text, timings)
                 metrics=getattr(service,'last_metrics',{})
                 if isinstance(metrics,dict):timings.update(metrics)
+                if 'api_retry_total_s' in timings:
+                    timings['api_total_s']=timings['api_retry_total_s']
                 self.events.put(('ai_metrics',record.record_id,revision,timings))
                 self.events.put(('ai', record.record_id, revision, candidate, reason))
             except AIError as exc:
                 metrics=getattr(service,'last_metrics',{})
                 if isinstance(metrics,dict):timings.update(metrics)
+                if 'api_retry_total_s' in timings:
+                    timings['api_total_s']=timings['api_retry_total_s']
                 self.events.put(('ai_metrics',record.record_id,revision,timings))
                 self.events.put(('ai_error', record.record_id, revision, str(exc)))
             except Exception as exc:
@@ -1895,7 +1920,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                     applied = self.controller.apply_ai_candidate(record_id, revision, candidate, reason)
                     metrics=getattr(self,'_ai_timings',{}).pop((record_id,revision),{})
                     metrics.update(getattr(self.controller,'last_ai_metrics',{}))
-                    metrics['total_s']=sum(float(metrics.get(k) or 0) for k in ('queue_s','api_total_s','verification_s','posting_s'))
+                    metrics['total_s']=sum(float(metrics.get(k) or 0) for k in ('queue_s','api_total_s','retry_wait_s','verification_s','posting_s'))
                     latest_for_time=self.store.get(record_id)
                     if latest_for_time and latest_for_time.revision==revision:
                         latest_for_time.ai_history.append({'action':'ai_timing','at':now().isoformat(),
@@ -1924,7 +1949,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                     was_manual = record_id in self._manual_ai
                     self._manual_ai.discard(record_id)
                     metrics=getattr(self,'_ai_timings',{}).pop((record_id,revision),{})
-                    metrics['total_s']=float(metrics.get('queue_s') or 0)+float(metrics.get('api_total_s') or 0)
+                    metrics['total_s']=sum(float(metrics.get(k) or 0) for k in ('queue_s','api_total_s','retry_wait_s'))
                     record = self.store.get(record_id)
                     if record and record.revision == revision and record.status in ('待确认', 'AI识别中'):
                         record.status = '部分识别' if record.pending_fragments and record.bets else '待确认'
@@ -2828,3 +2853,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
 # V261-20261101-RC1
 
 # V262-20261101-CUSTOMER-TRANSPORT
+
+# V264-20261102-AMOUNT-AUDIT
+
+# V265-20261102-AUTO-RECOGNIZE-SAFE-RETRY

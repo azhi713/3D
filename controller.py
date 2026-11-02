@@ -319,9 +319,18 @@ class Controller:
         text = self.settings.get('aliases', {}).get(record.raw_text.strip(), record.raw_text)
         bets, normalized, reason = parser.parse(record.lottery, text)
         claimed = parser.last_claimed
+        from amount_audit_v264 import audit_untyped_tail
+        receipt_rows = list(getattr(parser, 'last_receipts', []) or [])
+        audit_note = None
+        provisional_due = None
+        audit = audit_untyped_tail(text, bets, claimed, receipt_rows)
+        if audit and audit['kind'] in ('count', 'ambiguous'):
+            claimed, receipt_rows = audit['claimed'], audit['receipts']
+            audit_note = audit
         pending = []
         strict_ambiguous=(not bets and isinstance(reason,str) and
-                          any(x in reason for x in ('存在多种合理解释','与声明合计不一致','原文合计与投注金额不一致','本行小计与一单一组倍数冲突','一单一组的明确金额与单倍本金不符')))
+                          any(x in reason for x in ('存在多种合理解释','与声明合计不一致','原文合计与投注金额不一致','本行小计与一单一组倍数冲突','一单一组的明确金额与单倍本金不符',
+                                                    '声明注数与实际三位选号数量不一致')))
         if strict_ambiguous:
             pending=[{'start':0,'end':len(text),'text':text,'reason':reason}]
         if not bets and not strict_ambiguous:
@@ -338,17 +347,19 @@ class Controller:
             reason = '末尾自报合计与本地复算相符'
         # Full-lot and per-line claimed totals are INDEPENDENT evidence.
         # A plausible set of bets is not confirmation if money disagrees.
-        line_conflicts=[x for x in getattr(parser,'last_receipts',[])
+        line_conflicts=[x for x in receipt_rows
                         if cents(x['declared'])!=cents(x['computed'])]
         total_conflict=(claimed is not None and bets and not pending
                         and cents(claimed)!=sum(cents(b.principal) for b in bets))
         if bets and not pending and (total_conflict or line_conflicts):
             computed=sum(cents(b.principal) for b in bets)/100
+            provisional_due = sum(cents(b.principal) for b in bets)
             original_claimed=claimed
             explanation=(f'本地识别计算{computed:g}元，但原文合计{original_claimed:g}元；不能将猜测的倍数入账'
                          if total_conflict else '原文分组小计与本地识别金额不一致，需核对玩法和倍数')
             pending=[{'start':0,'end':len(text),'text':text,'reason':explanation}]
-            bets=[]  # Provisional guesses NEVER enter risk as partial bets.
+            # Preserve tentative details for human checking; amount_mismatch
+            # status below excludes the whole record from risk/settlement.
             reason=explanation
         pending = self._pending_with_policy(pending, text)
         record.source_original_text = record.source_original_text or record.raw_text
@@ -409,13 +420,21 @@ class Controller:
                     used_ai = True
                 else:
                     review_note = '；AI转换未通过本地校验：' + ai_error
+        # Re-audit after verified AI candidates have replaced tentative local bets.
+        # A bare trailing count is not a claimed cash receipt.
+        final_audit = audit_untyped_tail(text, bets, claimed, receipt_rows)
+        if final_audit and final_audit['kind'] in ('count', 'ambiguous'):
+            claimed, receipt_rows = final_audit['claimed'], final_audit['receipts']
+            audit_note = final_audit
         record.bets = bets
         record.pending_fragments = pending
         record.issues = pending[:]
         record.normalized_text = normalized
         record.claimed_amount = claimed
         due = sum(cents(b.principal) for b in bets)
-        record.computed_amount_yuan = due / 100
+        # Even a rejected provisional parse retains the arithmetic for audit,
+        # but its bets remain excluded from risk until verified.
+        record.computed_amount_yuan = (due if bets else (provisional_due or 0)) / 100
         record.declared_total_yuan = claimed
         if bets and pending:
             record.status = '部分识别'
@@ -433,7 +452,11 @@ class Controller:
         if review_note:
             record.note += review_note
         if bets and getattr(parser, 'last_warnings', None):
-            record.note += '；' + '；'.join(parser.last_warnings)
+            money_warnings = list(parser.last_warnings)
+            if audit_note and audit_note['kind'] in ('count', 'ambiguous') and not receipt_rows:
+                money_warnings = [w for w in money_warnings if not str(w).startswith('行金额不一致：')]
+            if money_warnings:
+                record.note += '；' + '；'.join(money_warnings)
         if used_ai:
             record.note += '；AI转换已通过程序校验，自动计入' if not allow_conflict else '；AI候选经人工确认并通过本地校验'
         if record.claimed_amount is not None and bets and not pending:
@@ -442,10 +465,29 @@ class Controller:
                 record.parse_status = 'amount_mismatch'
                 record.issues.append({'code':'amount_mismatch', 'ai_eligible':False,
                                       'declared':record.claimed_amount, 'computed':due/100})
-        for receipt in getattr(parser,'last_receipts',[]):
+        for receipt in receipt_rows:
             if cents(receipt['declared'])!=cents(receipt['computed']):
                 record.issues.append({'code':'line_amount_mismatch','ai_eligible':False,**receipt})
                 if not pending:record.parse_status='amount_mismatch'
+        # Status and money verification are separate facts.
+        # Never display '已识别/自动计入' while amount_mismatch is active.
+        if record.parse_status == 'amount_mismatch':
+            record.status = '待确认'
+            record.note = record.note.replace('AI转换已通过程序校验，自动计入',
+                                              'AI投注明细已通过校验，但金额未核对，不计入风险')
+            record.note += '；金额不一致，投注暂不计入风险和正式结算'
+        if provisional_due is not None:
+            record.status = '待确认'
+            record.parse_status = 'amount_mismatch'
+            record.note += f'；本地暂算应收{money(provisional_due)}元（全部明细待核对，未计入风险）'
+        if audit_note:
+            record.note += '；' + audit_note['note']
+            if audit_note['kind'] == 'ambiguous' and bets:
+                record.status = '待确认'
+                record.parse_status = 'needs_review'
+                record.issues.append({'code':'untyped_tail_ambiguous', 'ai_eligible':False,
+                                      'value':audit_note['value'], 'computed':audit_note['due']})
+                record.note += '；尾数含义未核对，投注暂不计入风险'
         self._annotate_bets(record, parser)
 
     def add(self, lottery, text, source='人工', message_id='', sender='', group_id='', created_at=None, period=None):
@@ -501,6 +543,7 @@ class Controller:
                 x.note += f'（整条{common_total:g}元，当前两彩已确认{due/100:g}元）'
                 if complete and not equal:
                     x.parse_status = 'amount_mismatch'
+                    x.status = '待确认'
                     x.issues.append({'code':'shared_amount_mismatch', 'ai_eligible':False,
                                      'declared':float(common_total), 'computed':due/100})
                 self.store.update(x, '双彩共同合计校验')
@@ -570,7 +613,10 @@ class Controller:
             record.note += '；AI说明：'+reason[:200]
         posting=perf_counter()
         try:
-            self.store.update(record, 'AI转换程序校验并自动计入' if record.status=='已识别' else 'AI转换未通过校验',expected_revision=revision)
+            self.store.update(record,
+                 ('AI转换程序校验并自动计入' if record.status=='已识别' else
+                  'AI已识别投注，金额待核对' if record.parse_status=='amount_mismatch' else
+                  'AI转换未通过校验'), expected_revision=revision)
         except StaleRecordError:
             return False
         self.last_ai_metrics['posting_s']=perf_counter()-posting
@@ -912,3 +958,7 @@ class Controller:
 # V260-20261101-RC1
 
 # V261-20261101-RC1
+
+# V264-20261102-AMOUNT-AUDIT
+
+# V265-20261102-AUTO-RECOGNIZE-SAFE-RETRY

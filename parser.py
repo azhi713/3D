@@ -158,6 +158,14 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        from recognition_v265 import parse_v265
+        complete_v265 = parse_v265(self, lottery, text)
+        if complete_v265 is not None:
+            return complete_v265
+        from recognition_amount_v264 import parse_amount_v264
+        amount_checked = parse_amount_v264(self, lottery, text)
+        if amount_checked is not None:
+            return amount_checked
         from recognition_v261 import parse_v261
         deterministic = parse_v261(self, lottery, text)
         if deterministic is not None:
@@ -890,3 +898,7 @@ class BetParser:
 # V260-20261101-RC1
 
 # V261-20261101-RC1
+
+# V264-20261102-AMOUNT-AUDIT
+
+# V265-20261102-AUTO-RECOGNIZE-SAFE-RETRY
