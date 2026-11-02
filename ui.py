@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from time import perf_counter
 
+from shortcut_mixin_v261 import ShortcutMixin
+from ai_priority_v260 import PriorityExecutor
 from config import APP_NAME, APP_VERSION, LOTTERIES, DEFAULT_AI_PROMPT, ENGINE_VERSION
 from models import cents, money, now
 from data_store import DataStore
@@ -48,6 +50,7 @@ class RecordTable(tk.Frame):
         self.columns = columns
         self._rows = {}
         self._selected = []
+        self._focused_iid = None
         self._callbacks = {}
         self._tags = {}
         self._vars = {}
@@ -120,6 +123,9 @@ class RecordTable(tk.Frame):
             iid,offset,old_top=anchor
             target=(self._rows[iid]['top']+offset) if iid in self._rows else old_top
             self.canvas.yview_moveto(max(0,target)/max(1,top))
+        if getattr(self,'_scroll_to_latest',False):
+            self._scroll_to_latest=False
+            self.canvas.yview_moveto(1)
 
     def destroy(self):
         if self._layout_timer:
@@ -201,11 +207,14 @@ class RecordTable(tk.Frame):
             return
         tags = row['tags']
         pending = 'pending' in tags
-        state=(pending,selected)
+        processing = 'processing' in tags
+        focused=(iid==self._focused_iid)
+        state=(pending,processing,selected,focused)
         if row.get('paint_state')==state:return
         row['paint_state']=state
-        bg = '#dce8ff' if selected else ('#fff7ed' if pending else 'white')
-        fg = RED if pending else INK
+        bg = '#dce8ff' if selected else '#dceaff' if focused else ('#eef5ff' if processing else '#fff7ed' if pending else 'white')
+        fg = BLUE if processing else RED if pending else INK
+        row['frame'].configure(highlightbackground=BLUE if focused else '#e0e7ee')
         row['frame'].configure(bg=bg)
         for w in row['widgets']:
             if isinstance(w, tk.Checkbutton):
@@ -220,8 +229,21 @@ class RecordTable(tk.Frame):
             cb(event)
         return 'break'
 
+    def _set_focus_record(self,iid):
+        if iid not in self._rows:return
+        before=self._focused_iid
+        self._focused_iid=iid
+        self.canvas.focus_set()
+        if before in self._rows and before!=iid:self._paint(before,before in self._selected)
+        self._paint(iid,iid in self._selected)
+
+    def _row_click(self,iid,event):
+        self._set_focus_record(iid)
+        return None
+
     def _row_right(self, iid, event):
-        # 右键只弹菜单，绝不改变当前勾选状态。
+        # Right click focuses exactly this row, without changing checkboxes.
+        self._set_focus_record(iid)
         cb = self._callbacks.get('<Button-3>')
         if cb:
             event.iid = iid
@@ -229,7 +251,8 @@ class RecordTable(tk.Frame):
         return 'break'
 
     def _row_double(self, iid, event):
-        # 数据行只在双击时切换选择；单击行本身不做选择。
+        # Double click toggles checkbox selection and also focuses the row.
+        self._set_focus_record(iid)
         if iid in self._selected:
             self._selected.remove(iid)
         else:
@@ -242,7 +265,7 @@ class RecordTable(tk.Frame):
         if iid in self._rows:
             self.update_row(iid,values,tags)
             return iid
-        frame = tk.Frame(self.canvas, bg='white')
+        frame = tk.Frame(self.canvas, bg='white',highlightthickness=1,highlightbackground='#e0e7ee')
         var = tk.BooleanVar(value=False)
         chk = tk.Checkbutton(frame, variable=var, command=lambda i=iid:self._checkbox_toggle(i), bg='white', activebackground='white', bd=0)
         chk.grid(row=0,column=0,sticky='nsew',padx=2)
@@ -257,11 +280,13 @@ class RecordTable(tk.Frame):
             frame.columnconfigure(col, weight=self._weights.get(key,0), minsize=self._mins[key])
             widgets.append(lbl)
         frame.columnconfigure(0,minsize=34)
+        frame.bind('<Button-1>', lambda e,i=iid:self._row_click(i,e))
         frame.bind('<Double-1>', lambda e,i=iid:self._row_double(i,e))
         frame.bind('<Button-3>', lambda e,i=iid:self._row_right(i,e))
         for w in widgets:
             # 复选框只走自身 command，避免“勾上后又被行点击逻辑取消”。
             if not isinstance(w, tk.Checkbutton):
+                w.bind('<Button-1>', lambda e,i=iid:self._row_click(i,e))
                 w.bind('<Double-1>', lambda e,i=iid:self._row_double(i,e))
             w.bind('<Button-3>', lambda e,i=iid:self._row_right(i,e))
             w.bind('<MouseWheel>', self._wheel)
@@ -332,12 +357,18 @@ class RecordTable(tk.Frame):
             self._vars.pop(iid,None)
             if iid in self._selected:
                 self._selected.remove(iid)
+            if iid==self._focused_iid:self._focused_iid=None
         if not self._rows:
             # Canvas滚动坐标不会随最后一行销毁自动清零；不归零就会形成
             # 顶部大片空白、仅一条旧行停在底部的“删除未清干净”假象。
             self.canvas.yview_moveto(0)
             self.canvas.configure(scrollregion=(0, 0, 0, 0))
         self._sync_checks()
+
+    def scroll_to_latest(self):
+        """Move after lazy canvas layout, not before it gets its new scrollregion."""
+        self._scroll_to_latest=True
+        self._schedule_layout()
 
     def reset_scroll(self):
         """批量刷新数据后同步滚动范围，删除最后一行也保持空表正常布局。"""
@@ -361,7 +392,7 @@ class RiskGridTable(ttk.Treeview):
         self.tag_configure('negative', foreground='#bd3148')
 
 
-class RiskApp(tk.Tk):
+class RiskApp(ShortcutMixin, tk.Tk):
     def __init__(self, base_dir):
         super().__init__()
         self.base_dir = Path(base_dir)
@@ -375,6 +406,14 @@ class RiskApp(tk.Tk):
         self.configure(bg=BG)
         self.store = DataStore(base_dir)
         self.controller = Controller(self.store)
+        # A process restart must not leave stale 'AI识别中' forever.
+        for old in self.controller.records():
+            if old.status=='AI识别中' and old.ai_request_state in ('queued','started'):
+                prior=old.ai_request_state
+                old.status='部分识别' if old.bets and old.pending_fragments else '待确认'
+                old.ai_request_state='unknown_billing' if prior=='started' else 'interrupted'
+                old.note='上次软件退出时AI任务被中断；已发送请求可能产生费用，请核对后手动重试' if prior=='started' else '上次排队任务未完成，可重新识别'
+                self.store.update(old,'恢复未完成AI任务')
         self.lottery = tk.StringVar(value='福彩')
         self.period = tk.StringVar(value=self.controller.period)
         self.threshold = tk.StringVar(value=str(self.controller.settings['risk_threshold']))
@@ -387,7 +426,7 @@ class RiskApp(tk.Tk):
         self._draw_busy = False
         self._draw_lookup_request = 0
         self.events = queue.Queue()
-        self.pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='bet-ai')
+        self.pool = PriorityExecutor(max_workers=max(1,min(32,int(self.controller.settings['ai'].get('max_concurrency',16)))), thread_name_prefix='bet-ai')
         self.risk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='risk-calc')
         self._risk_generation = 0
         self._risk_key = None
@@ -399,6 +438,8 @@ class RiskApp(tk.Tk):
         self.ai = AIService(self.controller.settings['ai'], self.ai_key, self.store.data_dir / 'ai_requests')
         self.ai_busy = set()
         self._manual_ai = set()
+        self._detail_window = None
+        self._ai_timings = {}
         self.wechat = WeChatService(self.store.path, self.controller.settings['wechat'])
         self.wechat.groups.update(dict(self.store.known_groups()))
         self.snapshot = None
@@ -416,8 +457,14 @@ class RiskApp(tk.Tk):
         self._risk_detail_number = None
         self._risk_source_items = {}
         self._draw_lookup_error_detail = ''
+        for old in self.controller.records():
+            if old.ai_request_state=='local_running':
+                old.ai_request_state='interrupted'
+                old.note='上次本地识别被中断，请点击重新识别继续'
+                self.store.update(old,'恢复中断的本地识别')
         self._style()
         self._build()
+        self._install_shortcuts()
         self.refresh()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self._timer = self.after(200, self.pump)
@@ -607,8 +654,15 @@ class RiskApp(tk.Tk):
         notebook.add(guide_tab, text='下单模板')
         records_tab.rowconfigure(1, weight=1)
         records_tab.columnconfigure(0, weight=1)
-        self.records_summary = ttk.Label(records_tab, text='今日0条 · 已识别0 · 未识别0 · 已选0')
-        self.records_summary.grid(row=0, column=0, sticky='ew', pady=(7, 5))
+        toolbar=ttk.Frame(records_tab)
+        toolbar.grid(row=0,column=0,sticky='ew',pady=(7,5))
+        self.records_summary=ttk.Label(toolbar,text='今日0条 · 已识别0 · 未识别0 · 已选0')
+        self.records_summary.pack(side='left')
+        self.record_search_var=tk.StringVar(value='')
+        self.record_search_entry=ttk.Entry(toolbar,textvariable=self.record_search_var,width=24)
+        self.record_search_entry.pack(side='right',padx=(6,0))
+        ttk.Label(toolbar,text='搜索号码/原文/状态').pack(side='right')
+        self.record_search_var.trace_add('write',lambda *_:self.refresh())
         self.records_tree = RecordTable(records_tab, [
             ('time', '时间', 75), ('source', '来源', 70), ('raw', '投注原文', 420),
             ('amount', '应收', 75), ('status', '状态', 95),
@@ -619,6 +673,10 @@ class RiskApp(tk.Tk):
         self.records_tree.on_selection_change = self._update_record_selection_count
         actions = ttk.Frame(records_tab)
         actions.grid(row=2, column=0, sticky='ew', pady=(7, 3))
+        for title,callback in [('全选',lambda:self.records_tree.select_all()),('反选',lambda:self.records_tree.invert_selection()),
+                               ('取消选择',lambda:self.records_tree.clear_selection()),
+                               ('选中待处理',lambda:self.select_record_status(False))]:
+            ttk.Button(actions,text=title,command=callback).pack(side='left',padx=(0,5))
         for title, command in [
             ('查看', self.view_record), ('修改／实收', self.edit_record),
             ('重新识别', self.reparse_selected), ('AI转换', self.ai_selected),
@@ -887,15 +945,26 @@ class RiskApp(tk.Tk):
         else:
             records = self._records_cache[1]
         rows = []
+        search=getattr(self,'record_search_var',None)
+        keyword=search.get().strip().casefold() if search is not None else ''
         for record in records:
-            has_partial = bool(record.bets and record.pending_fragments)
+            if keyword and not any(keyword in str(x).casefold() for x in (record.raw_text,record.sender,record.status)):
+                continue
+            has_partial = bool(record.status=='部分识别' and record.bets and record.pending_fragments and record.parse_status!='amount_mismatch')
             amount = (money(sum(cents(b.principal) for b in record.bets)) +
                       ('（部分）' if has_partial else '')) if record.status == '已识别' or has_partial else '—'
-            rows.append((record.record_id,(record.created_at[11:19], record.source, record.raw_text, amount, record.status),
+            visual_status=('本地识别中' if record.ai_request_state=='local_running' else
+                           'AI排队中' if record.ai_request_state=='queued' and record.status=='AI识别中' else record.status)
+            if record.parse_status=='amount_mismatch':
+                amount='—';visual_status='金额异常·待确认'
+            rows.append((record.record_id,(record.created_at[11:19], record.source, record.raw_text, amount, visual_status),
+                         ('processing',) if record.ai_request_state=='local_running' or record.status=='AI识别中' else
                          () if record.status == '已识别' else ('pending',)))
         self.records_tree.sync_rows(rows)
         recognized = sum(r.status == '已识别' for r in records)
-        self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 未识别{len(records)-recognized} · 已选{len(self.records_tree.selection())}')
+        in_queue=sum(r.ai_request_state=='queued' and r.status=='AI识别中' for r in records)
+        active=sum(r.ai_request_state=='started' and r.status=='AI识别中' for r in records)
+        self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 待处理{len(records)-recognized} · AI排队{in_queue} · 处理中{active} · 已选{len(self.records_tree.selection())}')
         periods = list(dict.fromkeys([now().date().isoformat(), self.controller.period]+self.store.periods()))
         self.period_combo.configure(values=periods)
         inputs = self.controller.analysis_inputs(lottery,records)
@@ -1279,7 +1348,7 @@ class RiskApp(tk.Tk):
         ttk.Button(buttons,text='开始读取',style='Accent.TButton',command=run).pack(side='right',padx=(0,8))
 
     def add_event(self, event):
-        if event.state & 1:
+        if event.state & (1|4):  # Shift+Enter newline, Ctrl+Enter configurable shortcut
             return None
         self.add_manual()
         return 'break'
@@ -1322,8 +1391,10 @@ class RiskApp(tk.Tk):
             elif self.lottery.get() not in lotteries:
                 self.lottery.set(added[0].lottery)
             self.refresh()
+            self.records_tree.scroll_to_latest()
             for item in added:
-                self.queue_ai(item)
+                self.queue_ai(item,refresh_ui=False)
+            if added:self.refresh()
             counts = '、'.join(f'{lottery}{sum(r.lottery == lottery for r in added)}条' for lottery in ('福彩','体彩') if lottery in lotteries)
             pending = sum(self.store.get(r.record_id).status != '已识别' for r in added)
             if pending:
@@ -1342,22 +1413,34 @@ class RiskApp(tk.Tk):
 
     def selected_record(self):
         selected = self.records_tree.selection()
-        if not selected:
-            return None
-        return self.store.get(selected[0])
+        rid=selected[0] if selected else self.records_tree._focused_iid
+        return self.store.get(rid) if rid else None
 
     def selected_records(self):
-        return [record for record in (self.store.get(iid) for iid in self.records_tree.selection()) if record]
+        ids=list(self.records_tree.selection())
+        if not ids and self.records_tree._focused_iid:
+            ids=[self.records_tree._focused_iid]
+        return [record for record in (self.store.get(iid) for iid in ids) if record]
 
     def context_record(self):
         return self.store.get(self._context_record_id) if self._context_record_id else None
 
     def view_record(self, record_id=None):
+        if self._detail_window is not None and self._detail_window.winfo_exists():
+            self._detail_window.lift()
+            self._detail_window.focus_force()
+            return
         record = self.store.get(record_id) if record_id else self.selected_record()
         if not record:
             return
         win = tk.Toplevel(self)
+        self._detail_window=win
+        win.transient(self)
+        win.after_idle(lambda: win.grab_set() if win.winfo_exists() else None)
+        win.lift()
+        win.bind('<Destroy>', lambda e: setattr(self,'_detail_window',None) if e.widget is win else None, add='+')
         win.title('投注详情')
+        win.bind('<Escape>',lambda e:win.destroy())
         win.geometry('740x540')
         win.minsize(610, 430)
         outer = ttk.Frame(win, padding=12)
@@ -1418,6 +1501,16 @@ class RiskApp(tk.Tk):
             lines.append('\nAI转换：'+record.ai_candidate)
         lines.append('\n逐笔明细：')
         lines.extend(f'{b.selection} {b.play} {b.multiplier}倍，应收{b.principal:g}元' for b in record.bets)
+        lines.append('AI任务状态：'+({'queued':'AI排队中','started':'AI识别中','responded':'AI已返回','failed':'识别失败','unknown_billing':'网络超时，计费不明'}.get(record.ai_request_state,'未运行')))
+        timed = next((h for h in reversed(record.ai_history) if isinstance(h,dict) and isinstance(h.get('timings'),dict)),None)
+        if timed:
+            t=timed['timings']
+            lines.append('\n最近一次AI耗时：')
+            if t.get('transport_used'):lines.append('实际请求方式：'+str(t['transport_used']))
+            if t.get('transport_attempts'):lines.append('请求尝试：'+', '.join(t['transport_attempts']))
+            for key,label in (('queue_s','排队'),('api_total_s','接口'),('verification_s','本地校验'),('total_s','总耗时')):
+                if isinstance(t.get(key),(int,float)):
+                    lines.append(f'{label}：{t[key]:.1f}秒')
         lines.append('确认实收：'+('未填写，按应收计入收入' if record.received_amount is None else f'{record.received_amount:g}元'))
         self.set_text(text, '\n'.join(lines))
 
@@ -1481,18 +1574,47 @@ class RiskApp(tk.Tk):
         self.reparse_selected(single_ok=True)
 
     def reparse_selected(self, single_ok=False):
-        records = self.selected_records()
+        records=self.selected_records()
         if not records:
+            self.add_feedback.configure(text='请先勾选或单击一条投注记录，再重新识别',foreground=ORANGE)
             return
-        if not messagebox.askyesno('重新识别', f'将重新识别 {len(records)} 条数据。\n识别结果可能变化，并会立即重新计算风险。\n确定继续？', parent=self):
+        if any(r.record_id in self.ai_busy for r in records):
+            messagebox.showinfo('任务正在处理','选中记录已有AI任务在执行，不能重复发起。',parent=self)
             return
-        try:
-            for record in records:
-                self.controller.reparse(record)
-                self.queue_ai(record)
+        if not messagebox.askyesno('重新识别',f'重新识别 {len(records)} 条；本地无法确定的将按规则提交AI。确定继续？',parent=self):
+            return
+        ids=[r.record_id for r in records]
+        for record in records:
+            if record.ai_request_state=='local_running':continue
+            record.ai_request_state='local_running'
+            self.store.update(record,'重新识别排队')
+        self.add_feedback.configure(text=f'已开始重新识别 {len(ids)} 条数据，本地识别中…',foreground=BLUE)
+        self.refresh()
+        def execute():
+            complete=0;waiting=0;errors=[]
+            for rid in ids:
+                latest=self.store.get(rid)
+                if not latest or latest.ai_request_state!='local_running':continue
+                try:
+                    self.controller.reparse(latest)
+                    complete+=1
+                    latest=self.store.get(rid)
+                    if latest and latest.status in ('待确认','部分识别'):
+                        before=rid in self.ai_busy
+                        self.queue_ai(latest,force=True,refresh_ui=False)
+                        if not before and rid in self.ai_busy:waiting+=1
+                except (ValueError,KeyError,ArithmeticError,sqlite3.Error) as exc:
+                    errors.append(str(exc)[:120])
+                    current=self.store.get(rid)
+                    if current:
+                        current.ai_request_state='failed'
+                        current.note='重新识别失败：'+str(exc)[:180]
+                        self.store.update(current,'本地重新识别失败')
             self.refresh()
-        except (ValueError, sqlite3.Error) as exc:
-            self.fail(exc)
+            feedback=f'本地识别完成 {complete} 条，已提交AI {waiting} 条'
+            if errors:feedback+='；失败：'+'；'.join(errors[:2])
+            self.add_feedback.configure(text=feedback,foreground=ORANGE if errors else '#167647')
+        self.after(35,execute)
 
     def delete_record(self):
         self.delete_selected()
@@ -1527,11 +1649,19 @@ class RiskApp(tk.Tk):
     def ai_selected(self):
         records = self.selected_records()
         if not records:
+            self.add_feedback.configure(text='请先勾选或单击一条待确认投注，再点击AI转换',foreground=ORANGE)
             return
         if len(records) > 1 and not messagebox.askyesno('AI转换选中数据', f'将把 {len(records)} 条待确认数据提交给AI转换。\n确定继续？', parent=self):
             return
+        started=0
         for record in records:
+            before=record.record_id in self.ai_busy
             self.queue_ai(record, force=True)
+            if not before and record.record_id in self.ai_busy:started+=1
+        if started:
+            self.add_feedback.configure(text=f'已提交 {started} 条AI识别任务，排队及进度请查看表格状态',foreground=BLUE)
+        elif records:
+            self.add_feedback.configure(text='没有新的AI请求提交；可能已识别、任务正在执行、无法提交或需要人工核对，请查看详情',foreground=ORANGE)
 
     def copy_selected_raw(self):
         records = self.selected_records()
@@ -1550,7 +1680,9 @@ class RiskApp(tk.Tk):
         records=[r for r in self.controller.records() if r.lottery==self.lottery.get()]
         recognized=sum(r.status=='已识别' for r in records)
         if hasattr(self,'records_summary'):
-            self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 未识别{len(records)-recognized} · 已选{len(self.records_tree.selection())}')
+            in_queue=sum(r.ai_request_state=='queued' and r.status=='AI识别中' for r in records)
+        active=sum(r.ai_request_state=='started' and r.status=='AI识别中' for r in records)
+        self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 待处理{len(records)-recognized} · AI排队{in_queue} · 处理中{active} · 已选{len(self.records_tree.selection())}')
 
     def record_context_menu(self, event):
         self._context_record_id = getattr(event, 'iid', None)
@@ -1567,8 +1699,8 @@ class RiskApp(tk.Tk):
         menu.add_command(label='选中已识别', command=lambda:self.select_record_status(True))
         menu.add_separator()
         menu.add_command(label='复制选中原始数据', command=self.copy_selected_raw)
-        menu.add_command(label='重新识别选中数据', command=self.reparse_selected)
-        menu.add_command(label='AI转换选中数据', command=self.ai_selected)
+        menu.add_command(label='重新识别选中数据'+self.shortcut_label('reparse'), command=self.reparse_selected)
+        menu.add_command(label='AI转换选中数据'+self.shortcut_label('ai_convert'), command=self.ai_selected)
         menu.add_separator()
         menu.add_command(label='删除当前数据', command=self.delete_current_record, foreground=RED, state='normal' if has_current else 'disabled')
         try:
@@ -1576,10 +1708,13 @@ class RiskApp(tk.Tk):
         finally:
             menu.grab_release()
 
-    def queue_ai(self, record, force=False, retry_feedback=''):
+    def queue_ai(self, record, force=False, retry_feedback='', refresh_ui=True):
         if record:
             record = self.store.get(record.record_id)
-        if not record or record.record_id in self.ai_busy:
+        if not record:return
+        if record.record_id in self.ai_busy:
+            if force and hasattr(self,'add_feedback'):
+                self.add_feedback.configure(text='该条AI任务正在排队或识别中，请勿重复提交',foreground=ORANGE)
             return
         if force and record.ai_request_state=='started' and record.status=='AI识别中':
             record.status='部分识别' if record.bets and record.pending_fragments else '待确认'
@@ -1588,6 +1723,9 @@ class RiskApp(tk.Tk):
             self.controller.reparse(record)
             record=self.store.get(record.record_id)
             self.refresh()
+        if force and record.status=='已识别' and record.parse_status=='amount_mismatch':
+            self.controller.reparse(record)
+            record=self.store.get(record.record_id)
         if record.status not in ('待确认', '部分识别'):
             if force and hasattr(self, 'add_feedback'):
                 if record.status == '规则违规':
@@ -1634,7 +1772,7 @@ class RiskApp(tk.Tk):
             record.ai_candidate = ''
         revision = record.revision
         record.status = 'AI识别中'
-        record.ai_request_state = 'started'
+        record.ai_request_state = 'queued'
         record.note = '正在转换，原文已保存；其他投注继续计算'
         self.store.update(record, '提交AI转换')
         self.ai_busy.add(record.record_id)
@@ -1644,6 +1782,7 @@ class RiskApp(tk.Tk):
         queued_at=perf_counter()
         def task():
             timings={'queue_s':perf_counter()-queued_at,'retry_count':1 if retry_feedback else 0}
+            self.events.put(('ai_started',record.record_id,revision))
             try:
                 candidate, reason = service.parse_unknown(record.lottery, ai_text)
                 metrics=getattr(service,'last_metrics',{})
@@ -1658,8 +1797,8 @@ class RiskApp(tk.Tk):
             except Exception as exc:
                 safe = _redact(str(exc), self.ai_key, [{'role':'user','content':ai_text}])
                 self.events.put(('ai_error', record.record_id, revision, 'AI执行失败（'+type(exc).__name__+'）：'+safe+'；原始数据已保存'))
-        self.pool.submit(task)
-        self.refresh()
+        self.pool.submit(task,priority=(0 if record.source=='微信' else 1 if record.source=='人工' else 2))
+        if refresh_ui:self.refresh()
 
     def _retry_invalid_ai_once(self, record_id):
         """模型已返回但本地复核没过：给一次携带错误原因的自动修正机会。"""
@@ -1728,6 +1867,14 @@ class RiskApp(tk.Tk):
                     _, rid, lottery, period, result, error = event
                     self._apply_draw_lookup(rid, lottery, period, result, error)
                     continue
+                if event[0]=='ai_started':
+                    _,rid,rev=event
+                    running=self.store.get(rid)
+                    if running and running.revision==rev and running.ai_request_state=='queued':
+                        running.ai_request_state='started'
+                        self.store.update(running,'AI实际请求开始')
+                        dirty=True
+                    continue
                 if event[0]=='ai_metrics':
                     if not hasattr(self,'_ai_timings'):self._ai_timings={}
                     self._ai_timings[(event[1],event[2])]=event[3]
@@ -1746,9 +1893,15 @@ class RiskApp(tk.Tk):
                         dirty=True
                         continue
                     applied = self.controller.apply_ai_candidate(record_id, revision, candidate, reason)
+                    metrics=getattr(self,'_ai_timings',{}).pop((record_id,revision),{})
+                    metrics.update(getattr(self.controller,'last_ai_metrics',{}))
+                    metrics['total_s']=sum(float(metrics.get(k) or 0) for k in ('queue_s','api_total_s','verification_s','posting_s'))
+                    latest_for_time=self.store.get(record_id)
+                    if latest_for_time and latest_for_time.revision==revision:
+                        latest_for_time.ai_history.append({'action':'ai_timing','at':now().isoformat(),
+                                                           'timings':metrics,'accepted':bool(applied)})
+                        self.store.update(latest_for_time,'保存本次AI耗时')
                     if isinstance(self.ai, AIService):
-                        metrics=getattr(self,'_ai_timings',{}).pop((record_id,revision),{})
-                        metrics.update(getattr(self.controller,'last_ai_metrics',{}))
                         self.ai._log('投注本地校验完成', accepted=bool(applied), record_id=record_id,**metrics)
                     if not applied:
                         latest = self.store.get(record_id)
@@ -1770,12 +1923,14 @@ class RiskApp(tk.Tk):
                     self.ai_busy.discard(record_id)
                     was_manual = record_id in self._manual_ai
                     self._manual_ai.discard(record_id)
-                    getattr(self,'_ai_timings',{}).pop((record_id,revision),None)
+                    metrics=getattr(self,'_ai_timings',{}).pop((record_id,revision),{})
+                    metrics['total_s']=float(metrics.get('queue_s') or 0)+float(metrics.get('api_total_s') or 0)
                     record = self.store.get(record_id)
                     if record and record.revision == revision and record.status in ('待确认', 'AI识别中'):
                         record.status = '部分识别' if record.pending_fragments and record.bets else '待确认'
-                        record.ai_request_state = 'unknown_billing' if ('超时' in reason or 'timed out' in reason.lower()) else 'failed'
+                        record.ai_request_state = 'unknown_billing' if any(x in reason for x in ('超时','timed out','请求状态未知','可能已发送')) else 'failed'
                         record.note = reason + ('；本地已识别部分仍保留' if record.bets else '')
+                        record.ai_history.append({'action':'ai_error','at':now().isoformat(),'timings':metrics})
                         if (self.controller.cutoff_applies(record.period)
                                 and not self.controller.ai_text_for_record(record)):
                             record.deadline_state = 'unresolved_at_deadline'
@@ -1820,7 +1975,7 @@ class RiskApp(tk.Tk):
                     self.after(10, lambda m=reason: self.fail(RuntimeError(m)))
             added, errors = self.controller.drain_inbox()
             for record in added:
-                self.queue_ai(record)
+                self.queue_ai(record,refresh_ui=False)
             dirty = dirty or bool(added)
             if errors:
                 self.wechat.last_error = errors[0]
@@ -2099,8 +2254,8 @@ class RiskApp(tk.Tk):
             pages[title] = page
             return page
 
-        for title in ['微信监听', 'AI识别', '计算规则', '赔率表', '自动封盘', '自定义写法', '数据管理']:
-            if title in {'计算规则', 'AI识别', '微信监听'}:
+        for title in ['微信监听', 'AI识别', '计算规则', '赔率表', '自动封盘', '快捷键', '自定义写法', '数据管理']:
+            if title in {'计算规则', 'AI识别', '微信监听', '快捷键'}:
                 make_scrollable_page(title)
             else:
                 page = ttk.Frame(notebook, padding=12)
@@ -2108,6 +2263,7 @@ class RiskApp(tk.Tk):
                 pages[title] = page
         settings = deepcopy(self.controller.settings)
         rules = deepcopy(self.controller.rules)
+        shortcut_values=self._make_shortcut_settings(pages['快捷键'],settings)
         fields = {}
         def entry(parent, label, value, key, show=None):
             row = ttk.Frame(parent)
@@ -2204,6 +2360,30 @@ class RiskApp(tk.Tk):
         ttk.Combobox(timeout_row, textvariable=ai_timeout, values=('15','30','60','90','120'),
                      state='readonly', width=12).pack(side='left')
         ttk.Label(timeout_row, text='秒（推荐60秒；只影响正常AI识别，诊断5/30秒独立）', foreground=MUTED).pack(side='left', padx=10)
+        concurrency=tk.StringVar(value=str(settings['ai'].get('max_concurrency',16)))
+        speed_row=ttk.Frame(ai_page)
+        speed_row.pack(fill='x',pady=5)
+        ttk.Label(speed_row,text='AI最大并发',width=23).pack(side='left')
+        ttk.Combobox(speed_row,textvariable=concurrency,values=('1','2','4','8','12','16','24','32'),state='readonly',width=10).pack(side='left')
+        ttk.Label(speed_row,text='修改后重启软件生效',foreground=MUTED).pack(side='left',padx=10)
+        reasoning=tk.StringVar(value=settings['ai'].get('reasoning_effort','off'))
+        reasoning_row=ttk.Frame(ai_page)
+        reasoning_row.pack(fill='x',pady=5)
+        ttk.Label(reasoning_row,text='推理强度',width=23).pack(side='left')
+        ttk.Combobox(reasoning_row,textvariable=reasoning,values=('off','none','low','medium'),state='readonly',width=10).pack(side='left')
+        ttk.Label(reasoning_row,text='off表示不发送该参数；请先确认中转站兼容性',foreground=MUTED).pack(side='left',padx=10)
+        # AI transport only changes how the same non-streaming POST is sent.
+        transport_labels={'自动选择（推荐）':'auto','Python urllib':'urllib',
+                          'HTTPX':'httpx','Windows cURL':'curl'}
+        configured_transport=settings['ai'].get('transport','auto')
+        transport_choice=tk.StringVar(value=next((name for name,mode in transport_labels.items()
+                                                  if mode==configured_transport),'自动选择（推荐）'))
+        transport_row=ttk.Frame(ai_page);transport_row.pack(fill='x',pady=5)
+        ttk.Label(transport_row,text='API发送方式',width=23).pack(side='left')
+        ttk.Combobox(transport_row,textvariable=transport_choice,
+                     values=list(transport_labels),state='readonly',width=24).pack(side='left')
+        ttk.Label(ai_page,text='自动方式：仅确认请求尚未发出时才切换 urllib → HTTPX → cURL；超时/HTTP错误不重复发送。',
+                  wraplength=760,foreground=MUTED).pack(anchor='w',pady=(0,6))
         key_widget = entry(ai_page, 'API Key（加密保存）', self.ai_key, 'ai_key', show='●')
         show_key = tk.BooleanVar()
         ttk.Checkbutton(ai_page, text='显示Key', variable=show_key, command=lambda:key_widget.configure(show='' if show_key.get() else '●')).pack(anchor='w')
@@ -2232,12 +2412,13 @@ class RiskApp(tk.Tk):
                 ai_prompt.insert('1.0', DEFAULT_AI_PROMPT)
         ttk.Button(prompt_actions, text='恢复默认提示词', command=reset_ai_prompt).pack(side='left')
 
-        test_label = ttk.Label(ai_page, text='')
+        test_label = ttk.Label(ai_page, text='', wraplength=760)
         test_label.pack(anchor='w', pady=8)
         def test_ai():
             service = AIService({'base_url':fields['ai_url'].get(), 'model':fields['ai_model'].get(), 'timeout':int(ai_timeout.get()), 'timeout_configured':True,
                                  'api_format':'completions' if api_format.get().startswith('GPT') else 'chat',
-                                 'json_mode':json_mode.get()}, fields['ai_key'].get())
+                                 'json_mode':json_mode.get(),
+                                 'transport':transport_labels[transport_choice.get()]}, fields['ai_key'].get())
             test_label.configure(text='正在测试…')
             def task():
                 try:
@@ -2247,6 +2428,29 @@ class RiskApp(tk.Tk):
                 self.events.put(('test', test_label, result))
             self.pool.submit(task)
         ttk.Button(ai_page, text='测试连接', command=test_ai).pack(anchor='w')
+        def test_all_transport_modes():
+            test_label.configure(text='正在逐个测试urllib、HTTPX、cURL；每种仅发送一次简短请求…')
+            configured={'base_url':fields['ai_url'].get().strip(),
+                        'model':fields['ai_model'].get().strip(),
+                        'api_format':'completions' if api_format.get().startswith('GPT') else 'chat',
+                        'json_mode':json_mode.get(),'timeout':int(ai_timeout.get()),
+                        'timeout_configured':True}
+            key=fields['ai_key'].get()
+            def worker():
+                outcome=[]
+                for mode in ('urllib','httpx','curl'):
+                    service=AIService(dict(configured,transport=mode),key)
+                    started=perf_counter()
+                    try:
+                        service.test_connection()
+                        text='成功'
+                    except Exception as exc:
+                        text=_redact(str(exc),key,[])[:80]
+                    outcome.append(f'{mode}: {text}（{perf_counter()-started:.1f}秒）')
+                self.events.put(('test',test_label,' | '.join(outcome)))
+            threading.Thread(target=worker,daemon=True,name='ai-transports-diagnostic').start()
+        ttk.Button(ai_page,text='逐个测试三种请求方式（会产生3次简短请求）',
+                   command=test_all_transport_modes).pack(anchor='w',pady=(6,0))
 
         def show_ai_diagnostics():
             # 所有值取自当前输入框，即使用户尚未保存设置也能排查。
@@ -2255,6 +2459,7 @@ class RiskApp(tk.Tk):
                 'model': fields['ai_model'].get().strip(),
                 'api_format': 'completions' if api_format.get().startswith('GPT') else 'chat',
                 'json_mode': json_mode.get(),
+                'transport': transport_labels[transport_choice.get()],
                 'timeout': int(ai_timeout.get()),
                 'timeout_configured': True,
                 'prompt': ai_prompt.get('1.0', 'end-1c').strip(),
@@ -2470,7 +2675,9 @@ class RiskApp(tk.Tk):
                     raise ValueError('AI解析提示词不能为空')
                 settings['ai'].update(base_url=fields['ai_url'].get().strip(), model=fields['ai_model'].get().strip(), auto_start=ai_auto.get(), enabled=self.controller.settings['ai'].get('enabled', False),
                                       api_format='completions' if api_format.get().startswith('GPT') else 'chat', json_mode=json_mode.get(), prompt=prompt_value,
-                                      timeout=int(ai_timeout.get()), timeout_configured=True)
+                                      timeout=int(ai_timeout.get()), timeout_configured=True,
+                                      max_concurrency=int(concurrency.get()), reasoning_effort=reasoning.get(),
+                                      transport=transport_labels[transport_choice.get()])
                 selected_backend = {'微信4.x本地监听（推荐）':'wechat4','本机消息桥接':'bridge','WCF采集服务':'wcf'}[backend.get()]
                 interval = float(fields['poll_interval'].get())
                 if not 0.2 <= interval <= 5:
@@ -2490,8 +2697,10 @@ class RiskApp(tk.Tk):
                             raise ValueError('自定义写法不能为空或重复')
                         mapping[key] = value
                 settings['aliases'] = mapping
+                settings['shortcuts'] = shortcut_values()
                 settings['ai']['api_key'] = fields['ai_key'].get().strip()
                 self.controller.save_settings(settings, rules)
+                self._reload_shortcuts()
                 self.ai_key = fields['ai_key'].get().strip()
                 self.ai = AIService(self.controller.settings['ai'], self.ai_key, self.store.data_dir / 'ai_requests')
                 was_listening = self.wechat.listening
@@ -2613,3 +2822,9 @@ class RiskApp(tk.Tk):
         self.destroy()
 
 # V257-20261031-source-evidence-hotfix
+
+# V260-20261101-RC1
+
+# V261-20261101-RC1
+
+# V262-20261101-CUSTOMER-TRANSPORT

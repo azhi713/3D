@@ -39,6 +39,10 @@ def _summary_lottery(line):
 def split_lottery_message(text, default_lottery):
     """按显式“福/3D/体/排”等标记拆分彩种；未标记内容沿用默认彩种。"""
     raw = unicodedata.normalize('NFKC', text or '')
+    from routing_v260 import split_shared_total
+    shared = split_shared_total(raw, default_lottery)
+    if shared is not None:
+        return shared[0]
     if default_lottery not in LOTTERIES:
         raise ValueError('请选择福彩或体彩')
 
@@ -154,8 +158,8 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
-        from recognition_v258 import parse_unambiguous
-        deterministic = parse_unambiguous(self, lottery, text)
+        from recognition_v261 import parse_v261
+        deterministic = parse_v261(self, lottery, text)
         if deterministic is not None:
             return deterministic
         from parser_v257 import parse_common_v257
@@ -882,3 +886,7 @@ class BetParser:
 # V257-20261031-source-evidence-hotfix
 
 # V258-LOCAL-RECOGNIZER-20261101
+
+# V260-20261101-RC1
+
+# V261-20261101-RC1

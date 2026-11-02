@@ -79,4 +79,8 @@ def decode_candidate(candidate,parser,lottery,source):
         return [],candidate,str(exc)
 
 # V257-20261031-source-evidence-hotfix
-from candidate_v257 import decode_candidate_v257 as decode_candidate
+from candidate_v261 import decode_candidate_v261 as decode_candidate
+
+# V260-20261101-RC1
+
+# V261-20261101-RC1

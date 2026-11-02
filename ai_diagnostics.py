@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from ai_service import AIService
+from ai_transport_v262 import open_transport_request, available_backends, TransportSetupError
 from config import DEFAULT_AI_PROMPT
 
 SAMPLE = '福293一单一组5倍，095组505组三一倍'
@@ -65,8 +66,10 @@ class AIDiagnostics:
             endpoint = urlsplit(req.full_url)
             self.note(f'请求端点: {endpoint.scheme}://{endpoint.netloc}{_safe(endpoint.path, self.key)}')
             self.note(f'请求体大小: {len(req.data or b"")} 字节')
-            self.note('请求方式: POST | 非流式 | 与程序AI服务共用请求结构')
-            with urllib.request.urlopen(req, timeout=timeout) as response:
+            self.note('请求方式: POST | 非流式 | 传输配置='+str(self.config.get('transport','auto')))
+            transport_info={}
+            with open_transport_request(req, timeout=timeout, config=self.config, metrics=transport_info) as response:
+                self.note('实际发送方式: '+str(transport_info.get('transport_used','未知'))+' | 尝试: '+', '.join(transport_info.get('transport_attempts',[])))
                 t_headers = time.perf_counter() - started
                 self.note(f'HTTP状态: {response.status} | 收到响应头: {t_headers:.3f}秒')
                 first = response.read(1)
@@ -108,6 +111,9 @@ class AIDiagnostics:
             self.note('返回字段: '+', '.join(sorted(str(k) for k in answer.keys())))
             self.note(f'本地JSON解析完成: {time.perf_counter()-started:.3f}秒')
             return True
+        except TransportSetupError as err:
+            self.note('结果: 请求方式不可用 | '+type(err).__name__)
+            return False
         except urllib.error.HTTPError as err:
             elapsed = time.perf_counter() - started
             self.note(f'结果: HTTP {err.code} | 用时: {elapsed:.3f}秒')
@@ -135,6 +141,7 @@ class AIDiagnostics:
         self.note('Python: '+platform.python_version())
         self.note('AI模型: '+_safe(self.config.get('model',''), self.key))
         self.note('接口模式: '+str(self.config.get('api_format', 'chat')))
+        self.note('发送配置: '+str(self.config.get('transport','auto'))+' | 可用组件: '+str(available_backends()))
         self.note('强制JSON: '+str(bool(self.config.get('json_mode', True))))
         self.note('已填写Key: '+str(bool(self.key)))
         for name in ('HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','NO_PROXY'):
@@ -164,3 +171,5 @@ class AIDiagnostics:
         path = self.output_dir / ('ai_diag_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.txt')
         path.write_text('\n'.join(self.lines)+'\n', encoding='utf-8-sig')
         return str(path), '\n'.join(self.lines)
+
+# V262-20261101-CUSTOMER-TRANSPORT

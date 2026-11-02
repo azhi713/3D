@@ -2,8 +2,8 @@
 from copy import deepcopy
 
 APP_NAME = "彩票实时风险预警"
-APP_VERSION = "V2.5.6"
-ENGINE_VERSION = "V2.5.6-semantic-evidence-diff"
+APP_VERSION = "V2.6.2-客户测试版"
+ENGINE_VERSION = "V2.6.1-RC1-verified-grammar-shortcuts"
 RULES_VERSION = "2026-10-26-catalog+2026-10-31-overlay-v2"
 
 LOTTERY_FC = "福彩"
@@ -91,6 +91,7 @@ DEFAULT_SETTINGS = {
     # 可关闭自动封盘，默认关闭以便任意时刻本地测试；开启后按北京时间21:14执行。
     "deadline": {"enabled": False},
     "aliases": {},
+    "shortcuts": {},  # Configurable Ctrl+key bindings (default mapping in shortcut_v261)
     # “处理方案”忽略补单本金：
     # 需要倍数 = ceil(当前净亏损 / 外部直选单倍返奖)
     "external_direct_prize": {
@@ -120,13 +121,16 @@ DEFAULT_SETTINGS = {
     "ai": {
         "provider": "OpenAI兼容接口",
         "base_url": "https://api.mmg.lat/v1",
-        "model": "gpt-5.5",
+        "model": "gpt-6-sol",
         "api_format": "completions",
+        "transport": "auto",  # urllib / HTTPX / Windows cURL; HTTP POST始终非流式
         "json_mode": False,
         "enabled": False,
         "auto_start": False,
         "timeout": 60,
         "timeout_configured": False,  # 兼容旧版数据库里的默认15秒；用户手动保存后为True
+        "max_concurrency": 16,  # 1-32; current running jobs finish on the old pool
+        "reasoning_effort": "off",  # no parameter unless verified supported by relay
         "prompt": DEFAULT_AI_PROMPT,
     },
 }
@@ -141,3 +145,9 @@ CN_NUM = {
 # V257-20261031-source-evidence-hotfix
 
 # V257-AI-AMOUNT-20261101
+
+# V260-20261101-RC1
+
+# V261-20261101-RC1
+
+# V262-20261101-CUSTOMER-TRANSPORT

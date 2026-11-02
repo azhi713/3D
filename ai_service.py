@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from config import DEFAULT_AI_PROMPT
+from ai_transport_v262 import open_transport_request, TransportSetupError
 
 SYSTEM = DEFAULT_AI_PROMPT
 _TIMEOUT_OPTIONS = (15, 30, 60, 90, 120)
@@ -136,6 +137,9 @@ class AIService:
             payload = {'model': self.config['model'].strip(), 'messages': messages, 'stream': False}
             if self.config.get('json_mode', True):
                 payload['response_format'] = {'type':'json_object'}
+            effort=self.config.get('reasoning_effort','off')
+            if effort in ('none','low','medium','high'):
+                payload['reasoning_effort']=effort
         request = urllib.request.Request(url, json.dumps(payload, ensure_ascii=False).encode('utf-8'),
                                          {'Authorization': 'Bearer '+self.api_key.strip(), 'Content-Type': 'application/json'})
         return request
@@ -161,10 +165,12 @@ class AIService:
             response_started=time.perf_counter()
             metrics['transport_stage']='connect_or_wait_headers'
             metrics['billing_state']='unknown_after_send'
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_transport_request(request, timeout=timeout, config=self.config, metrics=metrics) as response:
                 metrics['headers_s']=time.perf_counter()-response_started
                 metrics['transport_stage']='read_body'
                 self._log('收到响应头', request_id=rid, http_status=response.status,
+                          transport=metrics.get('transport_used','urllib'),
+                          attempts=metrics.get('transport_attempts',[]),
                           elapsed_s=round(time.perf_counter()-started,3))
                 body_started=time.perf_counter()
                 first=response.read(1)
@@ -195,6 +201,10 @@ class AIService:
             metrics['json_s']=time.perf_counter()-json_started
             self._log('JSON解析成功', request_id=rid, elapsed_s=round(time.perf_counter()-started,3), result_field_count=len(answer))
             return answer
+        except TransportSetupError as exc:
+            metrics['billing_state']='not_sent'
+            self._log('请求方式不可用', request_id=rid, error_type=type(exc).__name__)
+            raise AIError('AI发送方式配置错误：'+str(exc)+'；请求尚未发送') from None
         except urllib.error.HTTPError as exc:
             detail = _server_error(exc.read(_MAX_ERROR), self.api_key, messages)
             tag = ('认证失败，请检查API Key' if exc.code == 401 else '权限不足' if exc.code == 403 else
@@ -266,3 +276,7 @@ class AIService:
 # V257-20261031-source-evidence-hotfix
 
 # V257-AI-AMOUNT-20261101
+
+# V260-20261101-RC1
+
+# V262-20261101-CUSTOMER-TRANSPORT

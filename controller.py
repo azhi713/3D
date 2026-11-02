@@ -286,7 +286,8 @@ class Controller:
 
     def ai_text_for_record(self, record, allow_existing_candidate=False):
         """外部AI仅获得符合发送条件的疑难片段；违规与金额冲突不发送。"""
-        if self.deadline_enabled() and (is_closed(record.period, now()) or self.store.load_batch(record.period, record.lottery)):
+        from deadline_v260 import allow_candidate
+        if not allow_candidate(self, record):
             return ''
         if not record.bets and not re.search(r'[0-9]',record.raw_text):
             return ''  # 无选号数字的纯聊天，不花费模型请求去编造投注。
@@ -319,7 +320,11 @@ class Controller:
         bets, normalized, reason = parser.parse(record.lottery, text)
         claimed = parser.last_claimed
         pending = []
-        if not bets:
+        strict_ambiguous=(not bets and isinstance(reason,str) and
+                          any(x in reason for x in ('存在多种合理解释','与声明合计不一致','原文合计与投注金额不一致','本行小计与一单一组倍数冲突','一单一组的明确金额与单倍本金不符')))
+        if strict_ambiguous:
+            pending=[{'start':0,'end':len(text),'text':text,'reason':reason}]
+        if not bets and not strict_ambiguous:
             # 先保留可靠的子项；无论是否部分成功，都不能丢失完整原文语境。
             partial, pending, normalized = parser.parse_partial(record.lottery, text)
             if partial:
@@ -331,6 +336,20 @@ class Controller:
             claimed = sum(cents(b.principal) for b in bets) / 100
             pending = []
             reason = '末尾自报合计与本地复算相符'
+        # Full-lot and per-line claimed totals are INDEPENDENT evidence.
+        # A plausible set of bets is not confirmation if money disagrees.
+        line_conflicts=[x for x in getattr(parser,'last_receipts',[])
+                        if cents(x['declared'])!=cents(x['computed'])]
+        total_conflict=(claimed is not None and bets and not pending
+                        and cents(claimed)!=sum(cents(b.principal) for b in bets))
+        if bets and not pending and (total_conflict or line_conflicts):
+            computed=sum(cents(b.principal) for b in bets)/100
+            original_claimed=claimed
+            explanation=(f'本地识别计算{computed:g}元，但原文合计{original_claimed:g}元；不能将猜测的倍数入账'
+                         if total_conflict else '原文分组小计与本地识别金额不一致，需核对玩法和倍数')
+            pending=[{'start':0,'end':len(text),'text':text,'reason':explanation}]
+            bets=[]  # Provisional guesses NEVER enter risk as partial bets.
+            reason=explanation
         pending = self._pending_with_policy(pending, text)
         record.source_original_text = record.source_original_text or record.raw_text
         record.rules_version = RULES_VERSION
@@ -340,7 +359,8 @@ class Controller:
         if record.ai_candidate and (pending or not bets):
             eligible = [p for p in pending if p.get('ai_eligible')]
             forbidden = any(not frag['ai_eligible'] for frag in pending)
-            if forbidden or not eligible or self.cutoff_applies(record.period):
+            from deadline_v260 import allow_candidate
+            if forbidden or not eligible or not allow_candidate(self, record):
                 review_note = '；明确违规、冲突或已截止，AI候选不得改变原下注'
             else:
                 probe = BetParser(parser.rules, parser.policy)
@@ -434,7 +454,9 @@ class Controller:
         record_period = period or self.period
         clock = now()
         if record_period == clock.date().isoformat() and self.cutoff_applies(record_period, clock):
-            raise ValueError('今日21:14已截止接收，新投注未计入；原微信消息保留在收件箱')
+            from deadline_v260 import allow_late_inbox
+            if not allow_late_inbox(record_period, source, created_at, clock):
+                raise ValueError('今日21:14已截止接收，新投注未计入；原微信消息保留在收件箱')
         # 先分流，不因解析失败拒收原始消息；分流异常也保留完整原文。
         try:
             sections = split_lottery_message(text, lottery)
@@ -465,6 +487,23 @@ class Controller:
                 record.note = '本地识别异常，原始消息已保存：' + str(exc)[:200]
             self.store.update(record, '本地识别或待AI')
             self.last_added_records.append(record)
+        from routing_v260 import shared_total
+        common_total = shared_total(text, lottery)
+        if common_total is not None and len(self.last_added_records) > 1:
+            parts = self.last_added_records
+            complete = all(x.status == '已识别' and x.parse_status != 'amount_mismatch' for x in parts)
+            due = sum(cents(b.principal) for x in parts for b in x.bets)
+            equal = due == cents(common_total)
+            for x in parts:
+                x.note += ('；双彩共同合计已核对' if complete and equal else
+                           '；双彩共同合计有冲突，必须人工核对' if complete else
+                           '；原文包含双彩共同合计，另一个彩种尚未完全识别')
+                x.note += f'（整条{common_total:g}元，当前两彩已确认{due/100:g}元）'
+                if complete and not equal:
+                    x.parse_status = 'amount_mismatch'
+                    x.issues.append({'code':'shared_amount_mismatch', 'ai_eligible':False,
+                                     'declared':float(common_total), 'computed':due/100})
+                self.store.update(x, '双彩共同合计校验')
         return self.last_added_records[0] if self.last_added_records else None
 
     def possible_duplicate(self, lottery, text):
@@ -492,13 +531,23 @@ class Controller:
         record.ai_request_state = ''
         record.revision += 1
         self.parse_record(record)
-        record.review_status = 'manually_confirmed'
+        record.review_status = ('manually_confirmed' if record.status=='已识别'
+                                and record.parse_status!='amount_mismatch' else 'not_manually_reviewed')
         self.store.update(record, '人工修改')
 
     def reparse(self, record):
+        # User-requested retry must not be blocked by the previous AI
+        # candidate. Keep its trace for audit instead of reusing it.
+        if record.ai_candidate:
+            record.ai_history.append({'action':'reparse_discard_old_candidate',
+                                      'at':now().isoformat(),
+                                      'previous_candidate':record.ai_candidate})
+        record.ai_candidate = ''
         record.ai_request_state = ''
         record.revision += 1
         self.parse_record(record)
+        if record.status!='已识别' or record.parse_status=='amount_mismatch':
+            record.review_status='not_manually_reviewed'
         self.store.update(record, '重新识别')
 
     def apply_ai_candidate(self, record_id, revision, candidate, reason=''):
@@ -551,8 +600,11 @@ class Controller:
     def _batch_snapshot(self, period, lottery):
         """使用截止时的已验证子项生成不可变快照；未处理片段单独列示。"""
         records = [r for r in self.store.load_records(period) if r.lottery == lottery]
-        confirmed = [r for r in records if r.status == '已识别']
-        partial = [r for r in records if r.bets and r.pending_fragments]
+        confirmed = [r for r in records if r.status == '已识别' and r.parse_status!='amount_mismatch'
+                     and not any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in r.issues)]
+        partial = [r for r in records if r.status=='部分识别' and r.bets and r.pending_fragments
+                   and r.parse_status!='amount_mismatch'
+                   and not any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in r.issues)]
         confirmed_ids = {r.record_id for r in confirmed}
         partial = [r for r in partial if r.record_id not in confirmed_ids]
         bets = [b for r in confirmed + partial for b in r.bets]
@@ -589,35 +641,39 @@ class Controller:
                 'unresolved':unresolved}
 
     def tick_deadline(self, clock=None):
-        """界面定时调用；只要过21:14立即冻结并完成当批汇总，不等到21:15才计算。"""
+        """21:14 immutable cutoff snapshot; 21:15 final after pending AI window."""
+        from deadline_v260 import final_deadline_reached
+        from batch_schedule import is_closed, finalized_on_time
         simulated_clock = clock is not None
         clock = clock or now()
         period = clock.date().isoformat()
         if not self.cutoff_applies(period, clock):
             return []
-        results = []
+        results=[]
         for lottery in LOTTERIES:
-            existing = self.store.load_batch(period, lottery)
-            if existing and existing['state'] == 'finalized':
+            existing=self.store.load_batch(period, lottery)
+            if existing and existing['state']=='finalized':
                 continue
-            started = perf_counter()
-            if not existing:
-                snapshot = self._batch_snapshot(period, lottery)
-                self.store.freeze_batch(period, lottery, snapshot, clock.isoformat())
-                existing = self.store.load_batch(period, lottery)
-                # 截止时未解决项目保持原有可见状态，只追加独立的冻结状态。
-                for record in self.store.load_records(period):
-                    if record.lottery == lottery and record.status != '已识别':
-                        record.deadline_state = 'unresolved_at_deadline'
-                        self.store.update(record, '截止未解决标记')
-            if existing and existing['state'] == 'frozen':
-                finished = clock if simulated_clock else now()
-                summary = dict(existing['frozen'])
-                summary.update(finalized_at=finished.isoformat(),
-                               processing_seconds=round(perf_counter()-started,3),
-                               completed_before_21_15=finalized_on_time(period, finished))
-                if self.store.finalize_batch(period, lottery, summary, finished.isoformat()):
-                    results.append(summary)
+            if existing is None:
+                cutoff_snapshot=self._batch_snapshot(period, lottery)
+                self.store.freeze_batch(period, lottery, cutoff_snapshot, clock.isoformat())
+                existing=self.store.load_batch(period,lottery)
+                for item in self.store.load_records(period):
+                    if item.lottery==lottery and item.status!='已识别':
+                        item.deadline_state='unresolved_at_deadline'
+                        self.store.update(item,'21:14尚未解决标记')
+            if not final_deadline_reached(period,clock):
+                continue
+            if existing and existing['state']=='frozen':
+                started=perf_counter()
+                final_snapshot=self._batch_snapshot(period,lottery)
+                final_snapshot['cutoff_record_signature']=existing['frozen'].get('record_signature')
+                finished=clock if simulated_clock else now()
+                final_snapshot.update(finalized_at=finished.isoformat(),
+                                      processing_seconds=round(perf_counter()-started,3),
+                                      completed_before_21_15=finalized_on_time(period,finished))
+                if self.store.finalize_batch(period,lottery,final_snapshot,finished.isoformat()):
+                    results.append(final_snapshot)
         return results
 
     def preview_draw(self, lottery, draw, period=None):
@@ -626,9 +682,11 @@ class Controller:
         if lottery not in LOTTERIES or not isinstance(draw, str) or not re.fullmatch(r'[0-9]{3}', draw):
             raise ValueError('开奖号码必须是三位数字，例如012、293、000')
         records = [r for r in self.store.load_records(period) if r.lottery == lottery]
-        valid = [r for r in records if r.status == '已识别']
+        valid = [r for r in records if r.status == '已识别' and r.parse_status!='amount_mismatch'
+                 and not any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in r.issues)]
         partial = [r for r in records if r.status in ('部分识别', 'AI识别中', 'AI待确认')
-                   and r.pending_fragments and r.bets]
+                   and r.pending_fragments and r.bets and r.parse_status!='amount_mismatch'
+                   and not any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in r.issues)]
         counted = valid + partial
         bet_count = sum(len(r.bets) for r in counted)
         rules = self.store.load_period_rules(period) or {'rules':self.rules,'policy':self.settings['policy']}
@@ -659,7 +717,7 @@ class Controller:
                 if bet.play == '三码组三':
                     blockers.append('涉及三码组三，兑奖覆盖边界尚未完成核验')
                 blockers.extend(bet.settlement_rule_pending)
-        missing = [r for r in records if r.status != '已识别']
+        missing = [r for r in records if r.status != '已识别' or r.parse_status=='amount_mismatch']
         if missing:
             blockers.append(f'还有{len(missing)}条未完全识别/待审核记录；其未确认部分没有计入')
         if any(r.parse_status == 'amount_mismatch' for r in records):
@@ -693,7 +751,7 @@ class Controller:
         if not batch or batch['state'] != 'finalized':
             raise ValueError('请先完成当期截止汇总，再进行独立结算')
         records = [r for r in self.store.load_records(period) if r.lottery == lottery]
-        saved_signature = batch.get('frozen', {}).get('record_signature')
+        saved_signature = (batch.get('final') or {}).get('record_signature') or batch.get('frozen', {}).get('record_signature')
         if not saved_signature or saved_signature != self._record_signature(records):
             raise ValueError('封盘后投注明细已变化或旧版快照缺少校验信息，禁止以旧快照正式结算')
         if any(r.status != '已识别' or r.parse_status == 'amount_mismatch' for r in records):
@@ -725,10 +783,12 @@ class Controller:
 
     def analysis_inputs(self, lottery, records=None):
         records = [r for r in (self.records() if records is None else records) if r.lottery == lottery]
-        valid = [r for r in records if r.status == '已识别']
+        valid = [r for r in records if r.status == '已识别' and r.parse_status!='amount_mismatch'
+                 and not any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in r.issues)]
         # 只把逐笔本地验证通过的子项计入，未识别片段和整条实收都不混入。
         partial = [r for r in records if r.status in ('部分识别', 'AI识别中', 'AI待确认')
-                   and r.pending_fragments and r.bets]
+                   and r.pending_fragments and r.bets and r.parse_status!='amount_mismatch'
+                   and not any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in r.issues)]
         bets = [b for r in valid + partial for b in r.bets]
         revenue = (sum(cents(r.received_amount) if r.received_amount is not None else
                        sum(cents(b.principal) for b in r.bets) for r in valid)
@@ -809,7 +869,9 @@ class Controller:
     def explain(self, lottery, number):
         result = []
         for record in self.records():
-            if record.lottery != lottery or not (
+            if (record.lottery != lottery or
+                    record.parse_status=='amount_mismatch' or
+                    any(i.get('code') in ('line_amount_mismatch','shared_amount_mismatch') for i in record.issues)) or not (
                     record.status == '已识别' or
                     (record.status in ('部分识别', 'AI识别中', 'AI待确认')
                      and record.pending_fragments and record.bets)):
@@ -824,7 +886,7 @@ class Controller:
         added = []
         errors = []
         groups = {self.settings['wechat'].get('fc_group'): '福彩', self.settings['wechat'].get('tc_group'): '体彩'}
-        for inbox_id, payload in self.store.inbox(groups):
+        for inbox_id, payload in self.store.inbox(groups)[:12]:
             lottery = groups.get(payload['group_id'])
             if not lottery:
                 # 未绑定群保留，用户绑定后仍可接着处理。
@@ -846,3 +908,7 @@ class Controller:
 # V257-20261031-source-evidence-hotfix
 
 # V257-RECEIPT-FOLLOWUP-20261101
+
+# V260-20261101-RC1
+
+# V261-20261101-RC1
