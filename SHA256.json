@@ -1,0 +1,12 @@
+{
+  "build": "v257-local-hotfix-20261101-test-collision-fix",
+  "target": "azhi713/3D main 6348dabd8b05bcc11c061eca940556cb8becf6fa",
+  "files_sha256": {
+    "replacements/candidate_v257.py": "47a78c5f55c4f25b41d49dc3b4000de9b271b46efc732031fa99498cde0970ac",
+    "replacements/evidence_v257.py": "ee09d57ea90ec61609f8816a56aa2ac35d15f452827535fc3d0b3d5b2002dc9d",
+    "replacements/parser_v257.py": "361bec442b9b5c95133059ee33aac22b4393c9fa9d12b00ef64bdddc8fff282a",
+    "tests/test_v257_fix.py": "eb611dfa82e23094894d296aeac1126a804e59de615a5f46c6aad24ab1ba07d9",
+    "先阅读_安装与验收说明.txt": "c5b867cd7d736fb2d7402ddd78d814ff9485f392ce62e41f727322872249161d",
+    "安装补丁.py": "f816004e7ab420d7ec1f83034d78d1043908e7a5d1f10efde7443c0d1c67d253"
+  }
+}
