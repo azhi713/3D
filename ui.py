@@ -24,7 +24,8 @@ from ai_service import AIService, AIError, effective_timeout, _redact
 from ai_diagnostics import AIDiagnostics, SAMPLE as AI_DIAG_SAMPLE
 from parser import BetParser
 from wechat_service import WeChatService
-from risk_engine import plan_text
+from risk_engine import (plan_text, adjust_plan_rows,
+                         plan_financials, calculate_total_profit_cents)
 from data_contract import record_to_contract
 from draw_service import fetch_draw, DrawLookupError
 from ui_diff import sync_tree
@@ -425,6 +426,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._draw_preview = None
         self._draw_busy = False
         self._draw_lookup_request = 0
+        self._plan_adjustment = 0  # 全局补单倍数偏移；同一期新生成号码继续沿用
+        self._plan_rows = []
         self.events = queue.Queue()
         self.pool = PriorityExecutor(max_workers=max(1,min(32,int(self.controller.settings['ai'].get('max_concurrency',16)))), thread_name_prefix='bet-ai')
         self.risk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='risk-calc')
@@ -582,20 +585,30 @@ class RiskApp(ShortcutMixin, tk.Tk):
         threshold.bind('<KeyRelease>', self.filter_changed)
         ttk.Label(filters, text='元').pack(side='left', padx=(4, 0))
 
+        # V272：七项核心指标；方案盈亏只在顶部展示，今日总盈亏固定放最后。
         metrics = ttk.Frame(self)
         metrics.pack(fill='x', padx=pad, pady=(0, 8))
         self.cards = {}
-        for i, (key, label) in enumerate([
-            ('due', '有效投注应收'), ('income', '计入收入'),
-            ('risk', '达到阈值的号码'), ('loss', '当前最大净亏损'),
-        ]):
-            metrics.columnconfigure(i, weight=1, uniform='metric')
-            card = tk.Frame(metrics, bg='white', bd=1, relief='solid', padx=13, pady=8)
-            card.grid(row=0, column=i, sticky='ew', padx=(0, 8 if i < 3 else 0))
-            tk.Label(card, text=label, bg='white', fg=MUTED).pack(anchor='w')
-            value = tk.Label(card, text='—', bg='white',
-                             fg=RED if key == 'loss' else INK,
-                             font=('Microsoft YaHei UI', 18, 'bold'))
+        metric_specs = [
+            ('income', '今日收入'),
+            ('risk', '达到阈值的组数'),
+            ('loss', '当前最大净亏损'),
+            ('scheme_profit', '方案盈亏'),
+            ('payout', '实际赔付'),
+            ('scheme_income', '方案实际收入'),
+            ('total_profit', '今日总盈亏'),
+        ]
+        for i, (key, label) in enumerate(metric_specs):
+            row, col = divmod(i, 4)
+            metrics.columnconfigure(col, weight=1, uniform='metric')
+            card_bg = '#eaf7ef' if key == 'total_profit' else 'white'
+            card = tk.Frame(metrics, bg=card_bg, bd=1, relief='solid', padx=12, pady=7)
+            card.grid(row=row, column=col, columnspan=2 if key == 'total_profit' else 1,
+                      sticky='ew', padx=(0, 8 if col < 3 else 0), pady=(0, 5))
+            tk.Label(card, text=label, bg=card_bg, fg=MUTED).pack(anchor='w')
+            value = tk.Label(card, text='—', bg=card_bg,
+                             fg=RED if key in ('loss', 'payout') else INK,
+                             font=('Microsoft YaHei UI', 17 if key != 'total_profit' else 19, 'bold'))
             value.pack(anchor='w', pady=(1, 0))
             self.cards[key] = value
 
@@ -619,10 +632,32 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.workspace_tabs.pack(fill='both', expand=True, padx=pad, pady=(0, 8))
         records_page = ttk.Frame(self.workspace_tabs)
         risks_page = ttk.Frame(self.workspace_tabs)
-        draws_page = ttk.Frame(self.workspace_tabs)
         self.workspace_tabs.add(records_page, text='  投注管理  ')
-        self.workspace_tabs.add(risks_page, text='  实时风险  ')
-        self.workspace_tabs.add(draws_page, text='  开奖结算  ')
+        self.workspace_tabs.add(risks_page, text='  实时风险 / 开奖试算  ')
+
+        # V272：开奖号码输入并入实时风险页；三位输入自动试算，不提供正式结算入口。
+        draw_strip = ttk.LabelFrame(risks_page, text='开奖号码 · 自动试算', padding=(10, 7))
+        draw_strip.pack(fill='x', pady=(8, 6))
+        draw_line = ttk.Frame(draw_strip)
+        draw_line.pack(fill='x')
+        ttk.Label(draw_line, text='开奖号码').pack(side='left', padx=(0, 7))
+        self.draw_entry = ttk.Entry(draw_line, textvariable=self.draw_number, width=6,
+                                    font=('Consolas', 19, 'bold'), justify='center')
+        self.draw_entry.pack(side='left')
+        self.draw_entry.bind('<KeyRelease>', self._draw_edited)
+        self.draw_fetch_button = ttk.Button(draw_line, text='联网获取', command=self.lookup_draw)
+        self.draw_fetch_button.pack(side='left', padx=(9, 12))
+        self.draw_source_label = ttk.Label(draw_line, text='输入三位号码后自动试算',
+                                           foreground=MUTED)
+        self.draw_source_label.pack(side='left', fill='x', expand=True)
+        self.draw_error_more = ttk.Button(draw_line, text='查看联网详情',
+                                           command=self.show_draw_lookup_error)
+        self.draw_error_more.pack(side='right')
+        self.draw_error_more.pack_forget()
+        self.draw_summary_label = ttk.Label(
+            draw_strip, text='试算仅用于模拟，不写入投注记录或兑奖账本。',
+            foreground=MUTED, wraplength=1200, justify='left')
+        self.draw_summary_label.pack(fill='x', anchor='w', pady=(5, 0))
 
         # 第一页：录入区固定在上，记录表独占剩余全部空间。
         input_box = ttk.LabelFrame(records_page, text='手动补录', padding=(12, 9))
@@ -761,129 +796,33 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._risk_sash_initialized = False
         self.risk_pane.bind('<Configure>', self._position_initial_risk_details)
 
-        plan_box = ttk.LabelFrame(risk_panel, text='当前处理方案', padding=10)
+        plan_box = ttk.LabelFrame(risk_panel, text='建议补单方案', padding=10)
         plan_box.grid(row=0, column=1, sticky='nsew')
-        plan_box.rowconfigure(0, weight=1)
+        plan_box.rowconfigure(1, weight=1)
         plan_box.columnconfigure(0, weight=1)
+        plan_toolbar = ttk.Frame(plan_box)
+        plan_toolbar.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        self.plan_adjust_label = ttk.Label(plan_toolbar, text='全局调整：0倍 · 新增号码沿用当前倍数',
+                                           foreground=MUTED)
+        self.plan_adjust_label.pack(side='left')
+        self.plan_minus_button = ttk.Button(plan_toolbar, text='−', width=3,
+                                            command=lambda: self.adjust_plan(-1))
+        self.plan_minus_button.pack(side='right', padx=(5, 0))
+        self.plan_plus_button = ttk.Button(plan_toolbar, text='+', width=3,
+                                           command=lambda: self.adjust_plan(1))
+        self.plan_plus_button.pack(side='right')
         self.plan = tk.Text(plan_box, height=10, wrap='word', bg='white',
                             relief='solid', bd=1, fg=INK,
                             font=('Microsoft YaHei UI', 11))
-        self.plan.grid(row=0, column=0, sticky='nsew')
+        self.plan.grid(row=1, column=0, sticky='nsew')
         plan_row = ttk.Frame(plan_box)
-        plan_row.grid(row=1, column=0, sticky='ew', pady=(8, 0))
+        plan_row.grid(row=2, column=0, sticky='ew', pady=(8, 0))
         self.plan_note = ttk.Label(plan_row, text='')
         self.plan_note.pack(side='left')
         self.copy_button = ttk.Button(plan_row, text='一键复制',
                                       style='Accent.TButton', command=self.copy_plan)
         self.copy_button.pack(side='right')
 
-        # 第三页：独立纵向滚动；1366×768等小屏也能看到中奖明细和完整结算操作。
-        draw_host = draws_page
-        draw_canvas = tk.Canvas(draw_host, bg=BG, bd=0, highlightthickness=0)
-        draw_scroll = ttk.Scrollbar(draw_host, orient='vertical', command=draw_canvas.yview)
-        draw_canvas.configure(yscrollcommand=draw_scroll.set)
-        draw_scroll.pack(side='right', fill='y')
-        draw_canvas.pack(side='left', fill='both', expand=True)
-        draws_page = ttk.Frame(draw_canvas)
-        draw_window = draw_canvas.create_window((0, 0), anchor='nw', window=draws_page)
-        self.draw_canvas = draw_canvas
-        def update_draw_scroll(event=None):
-            draw_canvas.configure(scrollregion=draw_canvas.bbox('all'))
-        def fit_draw_width(event):
-            draw_canvas.itemconfigure(draw_window, width=event.width)
-        def scroll_draw(event):
-            if event.delta:
-                draw_canvas.yview_scroll(int(-event.delta / 120), 'units')
-            return 'break'
-        draws_page.bind('<Configure>', update_draw_scroll)
-        draw_canvas.bind('<Configure>', fit_draw_width)
-        draw_canvas.bind('<MouseWheel>', scroll_draw)
-        draws_page.bind('<MouseWheel>', scroll_draw)
-        # 左侧输入/核验操作，右侧金额结果；任何错误都可换行显示。
-        draws_page.columnconfigure(0, weight=4, uniform='draw')
-        draws_page.columnconfigure(1, weight=5, uniform='draw')
-        draws_page.rowconfigure(1, weight=1)
-        intro = ttk.Frame(draws_page)
-        intro.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(15, 10))
-        ttk.Label(intro, text='当前期开奖号码与赔付试算',
-                  font=('Microsoft YaHei UI', 14, 'bold')).pack(anchor='w')
-        ttk.Label(intro, text='跟随顶部选定彩种与日期。试算不改变投注和兑奖记录；正式结算需完成封盘。',
-                  foreground=MUTED).pack(anchor='w', pady=(4, 0))
-
-        draw_input = ttk.LabelFrame(draws_page, text='01  开奖号码', padding=15)
-        draw_input.grid(row=1, column=0, sticky='nsew', padx=(0, 10), pady=(0, 12))
-        ttk.Label(draw_input, text='按百位、十位、个位输入三位数字', foreground=MUTED).pack(anchor='w')
-        entry_row = ttk.Frame(draw_input)
-        entry_row.pack(fill='x', pady=(9, 10))
-        self.draw_entry = ttk.Entry(entry_row, textvariable=self.draw_number, width=8,
-                                    font=('Consolas', 24, 'bold'), justify='center')
-        self.draw_entry.pack(side='left')
-        self.draw_entry.bind('<KeyRelease>', self._draw_edited)
-        self.draw_fetch_button = ttk.Button(entry_row, text='联网获取', command=self.lookup_draw)
-        self.draw_fetch_button.pack(side='left', padx=(13, 0))
-        ttk.Button(draw_input, text='计算应赔金额', style='Accent.TButton',
-                   command=self.calculate_draw).pack(fill='x', pady=(0, 9))
-        action_row = ttk.Frame(draw_input)
-        action_row.pack(fill='x')
-        ttk.Button(action_row, text='中奖明细', command=self.show_draw_details).pack(side='left', fill='x', expand=True, padx=(0, 5))
-        ttk.Button(action_row, text='正式结算', command=self.save_draw_settlement).pack(side='left', fill='x', expand=True, padx=(5, 0))
-        ttk.Separator(draw_input).pack(fill='x', pady=(15, 12))
-        ttk.Label(draw_input, text='数据来源与联网核验',
-                  font=('Microsoft YaHei UI', 10, 'bold')).pack(anchor='w', pady=(0, 6))
-        self.draw_source_label = ttk.Label(draw_input, text='', foreground=MUTED,
-                                            justify='left', wraplength=375)
-        self.draw_source_label.pack(fill='x', anchor='w')
-        self.draw_error_more = ttk.Button(draw_input, text='查看联网详情', command=self.show_draw_lookup_error)
-        self.draw_error_more.pack(anchor='w', pady=(4, 0))
-        self.draw_error_more.pack_forget()
-        ttk.Label(draw_input, text='若官网尚未公布，可手动输入并先试算；联网失败不会清空已输入号码。',
-                  foreground=MUTED, wraplength=375).pack(anchor='w', pady=(14, 0))
-
-        draw_result = ttk.LabelFrame(draws_page, text='02  赔付结果', padding=15)
-        draw_result.grid(row=1, column=1, sticky='nsew', pady=(0, 12))
-        draw_result.columnconfigure(0, weight=1, uniform='draw-result')
-        draw_result.columnconfigure(1, weight=1, uniform='draw-result')
-        self.draw_cards = {}
-        for i, (key, title) in enumerate([
-            ('income', '计入收入'), ('payout', '应赔金额'),
-            ('net', '当期净盈亏'), ('count', '中奖明细'),
-        ]):
-            row, col = divmod(i, 2)
-            panel = tk.Frame(draw_result, bg='white', bd=1, relief='solid', padx=12, pady=14)
-            panel.grid(row=row, column=col, sticky='nsew', padx=(0, 8 if col == 0 else 0), pady=(0, 8))
-            tk.Label(panel, text=title, bg='white', fg=MUTED).pack(anchor='w')
-            value = tk.Label(panel, text='—', bg='white', fg=RED if key == 'payout' else INK,
-                             font=('Microsoft YaHei UI', 20, 'bold'))
-            value.pack(anchor='w', pady=(8, 0))
-            self.draw_cards[key] = value
-        ttk.Label(draw_result, text='试算说明 / 待核对事项',
-                  font=('Microsoft YaHei UI', 10, 'bold')).grid(
-                      row=2, column=0, columnspan=2, sticky='w', pady=(12, 5))
-        self.draw_summary_label = ttk.Label(draw_result,
-            text='填写三位开奖号码，或点击联网获取；试算不会写入兑奖账本。',
-            foreground=MUTED, wraplength=440, justify='left')
-        self.draw_summary_label.grid(row=3, column=0, columnspan=2, sticky='ew')
-        ttk.Label(draw_result, text='本期命中投注（完整明细仍可点击左侧「中奖明细」）',
-                  font=('Microsoft YaHei UI', 10, 'bold')).grid(
-                      row=4, column=0, columnspan=2, sticky='w', pady=(13, 5))
-        winners_box = ttk.Frame(draw_result)
-        winners_box.grid(row=5, column=0, columnspan=2, sticky='nsew')
-        winners_box.rowconfigure(0, weight=1)
-        winners_box.columnconfigure(0, weight=1)
-        self.draw_winners = ttk.Treeview(winners_box, columns=('play', 'selection', 'multiplier', 'payout'),
-                                          show='headings', selectmode='browse', height=6)
-        for key, title, width in [('play','玩法',120),('selection','投注号码',115),
-                                   ('multiplier','倍数',65),('payout','应赔金额',100)]:
-            self.draw_winners.heading(key, text=title)
-            self.draw_winners.column(key, width=width, minwidth=55, stretch=(key in ('play','selection')))
-        self.draw_winners.grid(row=0, column=0, sticky='nsew')
-        win_scroll = ttk.Scrollbar(winners_box, orient='vertical', command=self.draw_winners.yview)
-        win_scroll.grid(row=0, column=1, sticky='ns')
-        self.draw_winners.configure(yscrollcommand=win_scroll.set)
-        ttk.Label(draw_result, text='只展示已经通过本地校验的命中记录；未识别投注须另外核对。',
-                  foreground=MUTED, wraplength=460).grid(row=6, column=0, columnspan=2,
-                                                           sticky='w', pady=(5, 0))
-        draw_result.rowconfigure(5, weight=1)
     @staticmethod
     def tree(parent, columns):
         box = ttk.Frame(parent)
@@ -1023,17 +962,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 self.risk_source_title.configure(text='投注来源 · 请选择上方号码')
                 self.set_text(self.sources, '点选风险号码，再点下方投注行查看原始消息和赔付计算依据。')
             self.risk_info.configure(text=f'{len(self.snapshot.risks)}个号码达到当前筛选条件  ·  点击号码查看原始投注与赔付依据')
-            maximum = max((cents(p)-self.snapshot.revenue for p in self.snapshot.payouts.values()), default=0)
-            for name, value in [('due', money(self.snapshot.principal)+'元'), ('income', money(self.snapshot.revenue)+'元'), ('risk', str(len(self.snapshot.risks))), ('loss', money(max(0, maximum))+'元')]:
-                self.cards[name].configure(text=value)
-            text = plan_text(self.snapshot.risks,
-                             self.controller.settings['direct_unit_cost'][lottery], lottery)
-            if self.snapshot.pending:
-                text = ('[仅供人工核对 / 不可作为正式补单依据]\n'
-                        '当前统计不完整，存在未确认投注；不得直接按此方案下注。\n\n'+text)
-            self.set_text(self.plan, text)
-            note = '已计入全部补单成本' if self.controller.settings['include_hedge_cost'] else '倍数计算忽略补单成本'
-            self.plan_note.configure(text=note)
+            self._render_plan()
+            if re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip()):
+                self.calculate_draw(silent=True)
+            else:
+                self._simulate_risk_draw()
             warnings = []
             if self.snapshot.pending:
                 warnings.append(f'有{self.snapshot.pending}条待处理；已验证的部分投注已计入，未解决片段尚未计入，当前结果不完整。')
@@ -1063,8 +996,139 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 card.configure(text='—')
         self.update_status()
 
+    # V272-UI-MERGED-SIMULATION
+    def _adjusted_plan_rows(self):
+        if not self.snapshot:
+            return []
+        return adjust_plan_rows(self.snapshot.risks, self._plan_adjustment)
+
+    def _render_plan(self):
+        lottery = self.lottery.get()
+        self._plan_rows = self._adjusted_plan_rows()
+        text = plan_text(
+            self._plan_rows,
+            self.controller.settings['direct_unit_cost'][lottery],
+            lottery
+        )
+        if self.snapshot and self.snapshot.pending:
+            text = ('[仅供人工核对 / 不可作为正式补单依据]\n'
+                    '当前统计不完整，存在未确认投注；不得直接按此方案下注。\n\n' + text)
+        self.set_text(self.plan, text)
+        note = ('已计入全部补单成本' if self.controller.settings['include_hedge_cost']
+                else '倍数计算忽略补单成本')
+        self.plan_note.configure(text=note)
+        self.plan_adjust_label.configure(
+            text=f'全局调整：{self._plan_adjustment:+d}倍 · 新增号码沿用当前倍数')
+        has_plan = any(row.plan_multiplier > 0 for row in self._plan_rows)
+        can_decrease = any(row.plan_multiplier > 1 for row in self._plan_rows)
+        can_increase = bool(self.snapshot and any(
+            row.plan_multiplier > 0 for row in self.snapshot.risks))
+        self.plan_minus_button.configure(state='normal' if can_decrease else 'disabled')
+        # 即使当前已减到0倍，仍允许+按钮恢复基础建议倍数。
+        self.plan_plus_button.configure(state='normal' if can_increase else 'disabled')
+        self.copy_button.configure(
+            text=('复制核对草稿' if self.snapshot and self.snapshot.pending else '一键复制'),
+            state='normal' if has_plan else 'disabled')
+
+    def adjust_plan(self, delta):
+        # 全局调整所有补单组；每次±1，最低不低于0倍。
+        if not self.snapshot or not self._plan_rows:
+            return
+        if int(delta) < 0 and not any(row.plan_multiplier > 1 for row in self._plan_rows):
+            return
+        self._plan_adjustment += 1 if int(delta) > 0 else -1
+        self._render_plan()
+        self._render_risk_rows()
+        self._update_financial_cards()
+
+    def _simulate_risk_draw(self):
+        # 未输入实际开奖号码时，使用选中高风险号码作开奖前假设试算。
+        # 不更改开奖号码输入，也不写入正式结算或原始投注。
+        if not self.snapshot or re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip()):
+            return
+        number = self._risk_detail_number
+        candidates = [str(row.number) for row in self.snapshot.risks]
+        if number not in candidates:
+            number = candidates[0] if candidates else ''
+        if not re.fullmatch(r'[0-9]{3}', number):
+            self._draw_preview = None
+            self.draw_summary_label.configure(
+                text='当前没有达到阈值的号码。输入三位开奖号码后可单独试算。', foreground=MUTED)
+            self._update_financial_cards()
+            return
+        try:
+            self._draw_preview = self.controller.preview_draw(
+                self.lottery.get(), number, self.controller.period)
+        except (ValueError, KeyError) as exc:
+            self._draw_preview = None
+            self.draw_summary_label.configure(text='模拟试算失败：' + str(exc), foreground=RED)
+            self._update_financial_cards()
+            return
+        warning = ' · 存在未确认投注，结果仅供核对' if self._draw_preview.get('warnings') else ''
+        self.draw_summary_label.configure(
+            text=f'开奖前模拟：假设高风险号码 {number} 开出{warning}。点击左侧风险号码可切换模拟；输入真实三位开奖号码后自动切换。',
+            foreground=RED if warning else MUTED)
+        self._update_financial_cards()
+
+    def _update_financial_cards(self):
+        if self.snapshot:
+            maximum = max(
+                (cents(payout) - self.snapshot.revenue
+                 for payout in self.snapshot.payouts.values()),
+                default=0
+            )
+            self.cards['income'].configure(text=money(self.snapshot.revenue) + '元', fg=INK)
+            self.cards['risk'].configure(text=str(len(self.snapshot.risks)), fg=INK)
+            self.cards['loss'].configure(text=money(max(0, maximum)) + '元', fg=RED)
+        else:
+            for key in ('income', 'risk', 'loss'):
+                self.cards[key].configure(text='—', fg=INK if key != 'loss' else RED)
+
+        preview = self._draw_preview
+        if not preview:
+            for key in ('scheme_profit', 'payout', 'scheme_income', 'total_profit'):
+                self.cards[key].configure(text='—', fg=INK)
+            self.cards['payout'].configure(fg=RED)
+            return
+
+        lottery = self.lottery.get()
+        settings = self.controller.settings
+        result = plan_financials(
+            self._plan_rows,
+            preview['draw'],
+            settings['direct_unit_cost'][lottery],
+            settings['external_direct_prize'][lottery],
+            settings['external_leopard_direct_prize'][lottery],
+        )
+        if result['income_cents'] is None:
+            for key in ('scheme_profit', 'scheme_income', 'total_profit'):
+                self.cards[key].configure(text='—', fg=INK)
+            self.cards['payout'].configure(text='—', fg=RED)
+            return
+
+        today_income = (self.snapshot.revenue if self.snapshot
+                        else cents(preview['income_yuan']))
+        actual_payout = cents(preview['payout_yuan'])
+        total_profit = calculate_total_profit_cents(
+            today_income, actual_payout, result)
+        uncertain = bool(preview.get('warnings')) or bool(self.snapshot and self.snapshot.pending)
+        simulated = not re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip())
+        suffix = ('（模拟）' if simulated else '') + (' *' if uncertain else '')
+        scheme_profit = result['profit_cents']
+        scheme_income = result['income_cents']
+        self.cards['payout'].configure(
+            text=yuan_fmt(actual_payout / 100) + '元' + suffix, fg=RED)
+        self.cards['scheme_income'].configure(
+            text=yuan_fmt(scheme_income / 100) + '元' + suffix, fg=INK)
+        self.cards['scheme_profit'].configure(
+            text=('+' if scheme_profit >= 0 else '') + yuan_fmt(scheme_profit / 100) + '元' + suffix,
+            fg='#167647' if scheme_profit >= 0 else RED)
+        self.cards['total_profit'].configure(
+            text=('+' if total_profit >= 0 else '') + yuan_fmt(total_profit / 100) + '元' + suffix,
+            fg='#167647' if total_profit >= 0 else RED)
+
     def _sync_draw_context(self):
-        """彩种或期次变化后，旧号码/旧试算不得沿用。"""
+        # 彩种或期次变化后，旧号码、旧风险和旧方案模拟不得沿用。
         context = (self.lottery.get(), self.controller.period)
         if self._draw_context == context:
             return
@@ -1076,16 +1140,27 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.draw_error_more.pack_forget()
         self._draw_online = None
         self._draw_preview = None
+        self._plan_adjustment = 0
+        self._plan_rows = []
+        self.snapshot = None
+        self._risk_key = None
+        self._risk_detail_number = None
         self.draw_number.set('')
-        self.draw_winners.delete(*self.draw_winners.get_children())
-        for label in self.draw_cards.values():
-            label.configure(text='—')
-        self.draw_summary_label.configure(text='填写三位开奖号码，或点击联网获取；试算不会写入兑奖账本。', foreground=MUTED)
+        self.risks_tree.delete(*self.risks_tree.get_children())
+        self.source_rows.delete(*self.source_rows.get_children())
+        self.risk_source_title.configure(text='投注来源 · 请选择上方号码')
+        self.set_text(self.sources, '点选风险号码，再点下方投注行查看原始消息和赔付计算依据。')
+        self._render_plan()
+        self._update_financial_cards()
+        self.draw_summary_label.configure(
+            text='输入三位开奖号码后自动试算；试算不会写入兑奖账本。',
+            foreground=MUTED)
         saved = self.store.load_settlement(context[1], context[0])
         if saved:
-            self.draw_source_label.configure(text=f'本期已有正式结算：{saved["draw"]}，应赔 {saved["total_payout_yuan"]:g} 元（不可覆盖）')
+            self.draw_source_label.configure(
+                text=f'本期已有正式结算：{saved["draw"]}，应赔 {saved["total_payout_yuan"]:g} 元（不可覆盖）')
         else:
-            self.draw_source_label.configure(text='')
+            self.draw_source_label.configure(text='输入三位号码后自动试算')
 
     def _draw_edited(self, event=None):
         self._draw_lookup_request += 1
@@ -1093,11 +1168,16 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.draw_error_more.pack_forget()
         self._draw_online = None
         self._draw_preview = None
-        self.draw_winners.delete(*self.draw_winners.get_children())
-        for label in self.draw_cards.values():
-            label.configure(text='—')
-        self.draw_summary_label.configure(text='已修改开奖号码，点击“计算赔付”重新试算。', foreground=MUTED)
+        number = self.draw_number.get().strip()
         self.draw_source_label.configure(text='当前号码来源：手动输入')
+        if re.fullmatch(r'[0-9]{3}', number):
+            self.draw_summary_label.configure(text='已输入三位号码，正在自动试算…',
+                                              foreground=MUTED)
+            self.after_idle(lambda: self.calculate_draw(silent=True))
+        else:
+            self.draw_summary_label.configure(text='输入满三位数字后自动试算；试算不会写入兑奖账本。',
+                                              foreground=MUTED)
+            self._simulate_risk_draw()
 
     def lookup_draw(self):
         lottery, period = self.lottery.get(), self.controller.period
@@ -1156,100 +1236,46 @@ class RiskApp(ShortcutMixin, tk.Tk):
         if self._draw_lookup_error_detail:
             messagebox.showinfo('官网查询详情', self._draw_lookup_error_detail, parent=self)
 
-    def calculate_draw(self):
+    def calculate_draw(self, silent=False):
         number = self.draw_number.get().strip()
-        try:
-            preview = self.controller.preview_draw(self.lottery.get(), number, self.controller.period)
-        except (ValueError, KeyError) as exc:
-            messagebox.showwarning('无法计算开奖赔付', str(exc), parent=self)
+        if not re.fullmatch(r'[0-9]{3}', number):
+            self._draw_preview = None
+            self._update_financial_cards()
+            if not silent:
+                messagebox.showwarning('无法计算开奖赔付',
+                                       '请输入完整的三位开奖号码，例如012、185、000。',
+                                       parent=self)
             return
+        try:
+            preview = self.controller.preview_draw(
+                self.lottery.get(), number, self.controller.period)
+        except (ValueError, KeyError) as exc:
+            self._draw_preview = None
+            self._update_financial_cards()
+            self.draw_summary_label.configure(text='自动试算失败：' + str(exc), foreground=RED)
+            if not silent:
+                messagebox.showwarning('无法计算开奖赔付', str(exc), parent=self)
+            return
+
         self._draw_preview = preview
-        net = preview['net_income_yuan']
-        self.draw_cards['income'].configure(text=f'{preview["income_yuan"]:g}元')
-        self.draw_cards['payout'].configure(text=f'{preview["payout_yuan"]:g}元')
-        self.draw_cards['net'].configure(text=('+' if net >= 0 else '-') + f'{abs(net):g}元',
-                                          fg='#167647' if net >= 0 else RED)
-        self.draw_cards['count'].configure(text=f'{preview["winning_count"]}笔')
-        self.draw_winners.delete(*self.draw_winners.get_children())
-        for item in preview['lines']:
-            self.draw_winners.insert('', 'end', values=(
-                item['play'], item['selection'], item['multiplier'], f'{item["payout_yuan"]:g}元'))
-        self.draw_summary_label.configure(text=(
-            f'计入收入 {preview["income_yuan"]:g}元 · 应赔 {preview["payout_yuan"]:g}元 · '
-            f'净{("盈利" if net >= 0 else "亏损")} {abs(net):g}元 · '
-            f'中奖明细 {preview["winning_count"]}笔' +
-            (' · 结果不完整/需核对' if preview['warnings'] else ' · 已验证记录试算完毕')),
-            foreground=RED if preview['warnings'] else INK)
-        if self._draw_online and (self._draw_online.lottery, self._draw_online.draw_date, self._draw_online.number) == (self.lottery.get(),self.controller.period,number):
-            self.draw_source_label.configure(text=f'官网核对：{self._draw_online.draw_date} · 第{self._draw_online.issue}期 · {self._draw_online.source_name}', foreground=MUTED)
+        if preview['warnings']:
+            summary = '自动试算完成（存在核对提醒）：' + '；'.join(preview['warnings'][:4])
+            self.draw_summary_label.configure(text=summary, foreground=RED)
+        else:
+            self.draw_summary_label.configure(
+                text='自动试算完成；仅统计当前已验证投注，结果不会写入兑奖账本。',
+                foreground=MUTED)
+        self._update_financial_cards()
+        if (self._draw_online and
+                (self._draw_online.lottery, self._draw_online.draw_date, self._draw_online.number) ==
+                (self.lottery.get(), self.controller.period, number)):
+            self.draw_source_label.configure(
+                text=f'官网核对：{self._draw_online.draw_date} · 第{self._draw_online.issue}期 · {self._draw_online.source_name}',
+                foreground=MUTED)
         else:
             self._draw_online = None
-            self.draw_source_label.configure(text='号码来源：手动输入（未经过官网核验）', foreground=MUTED)
-
-    def show_draw_details(self):
-        if not self._draw_preview or self._draw_preview.get('draw') != self.draw_number.get().strip() or self._draw_preview.get('period') != self.controller.period or self._draw_preview.get('lottery') != self.lottery.get():
-            self.calculate_draw()
-        result = self._draw_preview
-        if not result:
-            return
-        win = tk.Toplevel(self)
-        win.title(f'{result["lottery"]} · {result["period"]} · 开奖{result["draw"]} · 中奖明细')
-        win.geometry('960x620')
-        win.transient(self)
-        headline = (f'开奖号码 {result["draw"]} | 已核对投注 {result["verified_bets"]}笔 | '
-                    f'命中明细 {result["winning_count"]}笔 | 应赔 {result["payout_yuan"]:g}元')
-        ttk.Label(win, text=headline, font=('Microsoft YaHei UI', 12, 'bold')).pack(anchor='w', padx=12, pady=(12,6))
-        if result['warnings']:
-            ttk.Label(win, text='注意：'+'；'.join(result['warnings']), foreground=RED, wraplength=920).pack(anchor='w', padx=12, pady=(0,6))
-        columns = ('play','selection','times','money','sender','source')
-        tree = ttk.Treeview(win, columns=columns, show='headings')
-        for key,label,width in [('play','玩法',130),('selection','号码',110),('times','倍数',70),('money','应赔元',95),('sender','来源',120),('source','原始投注',420)]:
-            tree.heading(key,text=label)
-            tree.column(key,width=width,minwidth=55,stretch=key=='source')
-        tree.pack(fill='both',expand=True,padx=12,pady=(0,8))
-        for line in result['lines']:
-            tree.insert('', 'end', values=(line['play'],line['selection'],line['multiplier'],
-                                          f'{line["payout_yuan"]:g}',line['sender'],line['raw_text']))
-        ttk.Button(win,text='关闭',command=win.destroy).pack(anchor='e',padx=12,pady=(0,10))
-
-    def save_draw_settlement(self):
-        """正式记账与试算分离：依旧要求已封盘、全笔无疑问。"""
-        if not self._draw_preview or self._draw_preview.get('draw') != self.draw_number.get().strip():
-            self.calculate_draw()
-        preview = self._draw_preview
-        if not preview:
-            return
-        if preview['blockers']:
-            messagebox.showwarning('不能正式结算', '还有待核对事项，当前仅允许试算：\n'+'\n'.join(preview['blockers']), parent=self)
-            return
-        if not self.controller.deadline_enabled():
-            messagebox.showwarning('不能正式结算', '21:14封盘开关当前关闭。仍然可以计算应赔并查看明细；正式结算需要启用封盘并完成当期截止汇总。', parent=self)
-            return
-        previous = self.store.load_settlement(self.controller.period, self.lottery.get())
-        if previous:
-            messagebox.showwarning('已结算', f'本期已结算开奖号码 {previous["draw"]}，不可覆盖。',parent=self)
-            return
-        online = self._draw_online
-        verified = bool(online and (online.lottery,online.draw_date,online.number)==
-                        (self.lottery.get(),self.controller.period,self.draw_number.get().strip()))
-        source = (f'{online.source_name} · {online.issue}期' if verified else '手动输入（未联网核验）')
-        prompt = (f'{self.lottery.get()} {self.controller.period} 开奖号码：{self.draw_number.get().strip()}\n'
-                  f'来源：{source}\n预计算应赔：{preview["payout_yuan"]:g}元\n\n'
-                  + (('核对提醒：'+'；'.join(preview['warnings'])+'\n') if preview['warnings'] else '') +
-                  '正式结算后不能覆盖旧账本，确定保存吗？')
-        if not messagebox.askyesno('确认正式开奖结算',prompt,parent=self):
-            return
-        draw_info = ({'source':online.source_name,'url':online.source_url,'issue':online.issue,
-                      'draw_date':online.draw_date,'verified_online':True} if verified else
-                     {'source':'手动输入','verified_online':False})
-        try:
-            saved = self.controller.record_settlement(self.lottery.get(),self.draw_number.get().strip(),
-                                                       period=self.controller.period, draw_info=draw_info)
-        except (ValueError, KeyError, sqlite3.Error) as exc:
-            self.fail(exc)
-            return
-        self.draw_source_label.configure(text=f'已保存正式结算：{saved["draw"]} · 应赔{saved["total_payout_yuan"]:g}元（不可覆盖）')
-        messagebox.showinfo('正式结算已保存',f'应赔 {saved["total_payout_yuan"]:g} 元，账本已单独保存。',parent=self)
+            self.draw_source_label.configure(
+                text='号码来源：手动输入（未经过官网核验）', foreground=MUTED)
 
     def update_status(self):
         ai_on = bool(self.controller.settings['ai'].get('enabled'))
@@ -2075,7 +2101,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def _render_risk_rows(self):
         if not self.snapshot:
             return
-        rows = list(self.snapshot.risks)
+        rows = adjust_plan_rows(self.snapshot.risks, self._plan_adjustment)
         key = self._risk_sort_key
         keyfunc = {
             'number': lambda r: r.number,
@@ -2105,6 +2131,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
             return
         number = selected[0]
         self._risk_detail_number = number
+        if not re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip()):
+            self._simulate_risk_draw()
         matched = self.controller.explain(self.lottery.get(), number)
         old_selection = self.source_rows.selection()
         self._risk_source_items = {}

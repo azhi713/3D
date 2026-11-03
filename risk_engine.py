@@ -1,6 +1,7 @@
 """以分计算金额；只枚举真实开奖号码，组六的排列不会重复赔付。"""
 from functools import lru_cache
 from fractions import Fraction
+from decimal import Decimal
 from config import RULES_BY_LOTTERY
 from models import RiskRow, cents, money
 from itertools import permutations, combinations
@@ -140,6 +141,49 @@ class RiskEngine:
             if payout:
                 rows.append({**bet.to_dict(), 'payout': payout})
         return sorted(rows, key=lambda row: -row['payout'])
+
+
+# V272-PLAN-SIMULATION
+def adjust_plan_rows(rows, delta=0):
+    # 全局调整所有建议补单倍数；最低为0，0倍组不进入方案。
+    delta = int(delta)
+    adjusted = []
+    for row in rows:
+        base = int(row.plan_multiplier)
+        multiplier = max(0, base + delta) if base > 0 else 0
+        adjusted.append(RiskRow(row.number, row.payout, row.net_loss, multiplier))
+    return adjusted
+
+
+def plan_financials(rows, draw, unit_cost, direct_prize, leopard_prize):
+    # 使用设置页的外部返奖和每倍成本，不另建赔率规则。
+    unit = Decimal(str(unit_cost))
+    cost_cents = sum(
+        cents(unit * Decimal(str(row.plan_multiplier)))
+        for row in rows if int(row.plan_multiplier) > 0
+    )
+    valid_draw = (isinstance(draw, str) and len(draw) == 3 and
+                  draw.isascii() and draw.isdigit())
+    if not valid_draw:
+        return {'cost_cents': cost_cents, 'income_cents': None,
+                'profit_cents': None, 'hit_count': 0}
+    reward = Decimal(str(leopard_prize if len(set(draw)) == 1 else direct_prize))
+    income_cents = 0
+    hit_count = 0
+    for row in rows:
+        if str(row.number) == draw and int(row.plan_multiplier) > 0:
+            income_cents += cents(reward * Decimal(str(row.plan_multiplier)))
+            hit_count += 1
+    return {'cost_cents': cost_cents, 'income_cents': income_cents,
+            'profit_cents': income_cents - cost_cents, 'hit_count': hit_count}
+
+
+def calculate_total_profit_cents(today_income_cents, actual_payout_cents, plan_result):
+    # 今日总盈亏 = 今日收入 - 原投注实际赔付 + 补单方案收入 - 补单方案成本。
+    if plan_result.get('income_cents') is None:
+        return None
+    return (int(today_income_cents) - int(actual_payout_cents)
+            + int(plan_result['income_cents']) - int(plan_result['cost_cents']))
 
 
 def plan_text(rows, unit_cost=2, lottery='福彩'):
