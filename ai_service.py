@@ -248,22 +248,27 @@ class AIService:
             except ValueError:
                 pass
         instructions=(self.config.get('prompt') or DEFAULT_AI_PROMPT).strip()
-        instructions += ('\nV2.6.6独立识别协议：完整阅读输入JSON中的raw_text，'
-                         '以下新协议覆盖上述旧版只解释unresolved_segments的要求；local_confirmed仅供参考，不能限制AI理解；'
-                         '按真实source_segments分组返回全部可证实的candidate_bets；'
-                         '每笔含segment_id、bet_type、ticket_codes/digit_set/position_sets、'
-                         'bet_multiples、declared_amount_yuan、amount_kind、multiple_type；'
-                         '明确倍数保留原值，明确金额保留金额，未知写null；'
-                         '金额字段是该candidate_bets项全部号码的总金额，而不是每注金额；'
-                         '同一号码重复购买必须逐次表达；不准编造号码、玩法、金额、倍数；'
-                         '无法确定的子项列入uncertainties，仍返回可确定的候选。')
-        # 仅拼接识别协议，不覆盖用户设置中已保存的自定义提示词。
-        instructions += ('\nV2.6.7业务口径：双飞/飞必须依据完整上下文，不能单凭“福17飞10”假设10倍或10元；'
-                         '“一米直一米组”是直选每个号码1元、组选每个号码1元，不是1倍；'
-                         '候选declared_amount_yuan是该候选号码列表的分组金额，'
-                         '由每注1元乘号码数推导的小计须标明amount_type=inferred，'
-                         '只有原文明示金额才标explicit。四码及以上组合金额不能借给前面的其他投注。'
-                         '号码数量与声明注数冲突时，保留候选号码与uncertainties，不得杜撰缺失号码。')
+        # V271: Drop mutually contradictory legacy overlays; the single
+        # authoritative source-backed protocol below supersedes them.
+        # V271 authoritative business instruction. The legacy V267 text above
+        # remains for backward compatibility, but its contrary conclusions are
+        # superseded here. Do not replace any user-edited settings prompt.
+        instructions += ('\nV2.7.1最终核验口径（此段覆盖前面有冲突的旧指令）：'
+                         '先结合original_message阅读整条客户订单，再只输出lottery对应的raw_text当前彩种投注；'
+                         'source_segments只对应raw_text，不使用original_message的偏移。'
+                         'local_confirmed仅供参考，不能只输出未识别部分，也不能重复购买；'
+                         '必须返回当前彩种所有可由原文证明的candidate_bets。'
+                         '金额或米或块，及规则明确的玩法尾数，是客户投注金额，不是倍数；'
+                         '若没有写倍但单笔金额明确，用amount_kind=amount且倍数为null，交程序按实际本金反推。'
+                         '例如“福17飞10”：号码17，玩法双飞，金额10，倍数null；不得要求必须写“双飞”。'
+                         '例如“福689直选1倍\n101 102 103直4注8元”：整条共有4个直选号码，'
+                         '最后4注8元是整条总注数和合计，不是凭空增加第四个号码。'
+                         '明确倍数或注数/选号能够独立证明投注时，即使客户自报尾数错误也不取消投注；'
+                         '应在brief_reason说明客户金额与程序计算的差额，不能为了凑金额修改倍投。'
+                         '例如“福101 102 103直3㊗️5”：识别3注直选，客户5元有误，实际应收6元。'
+                         '若original_message包含“体01257\n福02369组六各10合计20”，'
+                         '按跨彩种共享的组六各10元识别每个号码池，但本次只输出lottery对应的候选。'
+                         '不得猜测未出现的号码或为补齐注数制造新号码。')
         # V257-RECEIPT-FOLLOWUP-20261101: deterministic receipt-backed candidates first.
         # Still validated by the normal period-specific candidate pipeline.
         from receipt_inference_v257 import infer_receipt_candidates

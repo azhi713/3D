@@ -158,6 +158,11 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        # V271: whole-message count reconciliation and amount-first shorthand.
+        from context_receipts_v271 import parse_context_order
+        contextual = parse_context_order(self, lottery, text)
+        if contextual is not None:
+            return contextual
         from recognition_v265 import parse_v265
         complete_v265 = parse_v265(self, lottery, text)
         if complete_v265 is not None:

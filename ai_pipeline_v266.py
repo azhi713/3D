@@ -242,16 +242,26 @@ def _one_candidate(item, parser, lottery, source):
     first=codes[0] if len(codes[0])==3 and codes[0].isdigit() else ''
     start,end,region=locate_evidence(source,item,first)
     play=_kind(item.get('bet_type') or item.get('play'),codes,region)
-    # Declared ticket count must not turn 3 named selections into 4 bets.
-    # Retain raw AI candidate for manual review, but reject automatic ledger entry.
+    # Source-wide count evidence can legitimately cover preceding lines.
+    # Do not permit this override when the previous ticket is absent.
+    from context_receipts_v271 import (parse_context_order,
+                                        contextual_bet_evidence,
+                                        play_bound_cash_evidence)
+    contextual=parse_context_order(parser,lottery,source)
     matched_count=re.search(r'(?:直选|直|单)\s*(\d+)\s*注',region)
     if (matched_count and all(len(code)==3 and code.isdigit() for code in codes)
             and len(codes)<int(matched_count.group(1))):
-        raise EvidenceError('声明'+matched_count.group(1)+'注，实际仅'+str(len(codes))+
-                            '个号码；AI候选保留待人工确认，不自动入账')
-    # 单独的‘飞10’不构成明确双飞，数字10也不能无单位直接用作倍数。
-    if play=='双飞' and not re.search(r'双飞',region):
-        raise EvidenceError('飞的玩法及金额/倍数需要更多上下文，不能自动认定双飞')
+        supported=(contextual is not None and
+                   len(contextual[0])==int(matched_count.group(1)) and
+                   all(any(b.play==play and b.selection==code for b in contextual[0])
+                       for code in codes))
+        if not supported:
+            raise EvidenceError('声明'+matched_count.group(1)+'注，原文全单未证明足够号码；不编造新注')
+    # The colloquial '飞' is a valid double-fly play when the source gives
+    # an exact two-digit selection and cash can be priced by runtime rules.
+    if play=='双飞' and (not re.search(r'双飞|飞',region)
+                        or not all(len(c)==2 and c.isdigit() for c in codes)):
+        raise EvidenceError('双飞选号或玩法不完整，不能凭空补全')
     if play in ('和值','跨度'):
         codes=[str(int(code)) for code in codes]
     amount=item.get('declared_amount_yuan',item.get('amount'))
@@ -299,8 +309,9 @@ def _one_candidate(item, parser, lottery, source):
                 and re.search(r'(?:直选|直|组[三六36]?|组选|双飞|飞)\s*各\s*\d+(?!\s*[倍元米块])',region)
                 and message_total(source) is None):
                 raise EvidenceError('无单位“各N”必须结合独立金额证据核实')
-            if not _has_local_multiplier(region,b.play,Decimal(str(mult))):
-                raise EvidenceError('倍数没有原文证据：'+str(mult))
+            if (not _has_local_multiplier(region,b.play,Decimal(str(mult)))
+                and not contextual_bet_evidence(parser,lottery,source,b)):
+                raise EvidenceError('倍数及整条上下文均没有原文证据：'+str(mult))
         else:
             unit=_v267_per_ticket_amount(region,b.play)
             mention=(unit is not None and unit*len(codes)==_number(amount,'金额'))
@@ -311,8 +322,10 @@ def _one_candidate(item, parser, lottery, source):
             if not mention:raise EvidenceError('金额没有原文证据：'+str(amount))
             # Converting a bare value into a multiple requires a complete total.
             # A numerical "1直1组" does NOT establish a monetary per-bet price.
-            if mention=='needs_total' and message_total(source) is None:
-                raise EvidenceError('无单位金额需要整单合计佐证')
+            if (mention=='needs_total' and message_total(source) is None
+                and not contextual_bet_evidence(parser,lottery,source,b)
+                and not play_bound_cash_evidence(region,b,amount)):
+                raise EvidenceError('无单位金额需要完整原文或玩法单倍本金佐证')
         b.source_span={'start':start,'end':end,'text':region,
                        'position_verified':True, 'segment_id':item.get('segment_id')}
         if mode=='amount':
@@ -327,7 +340,10 @@ def _one_candidate(item, parser, lottery, source):
         if len(bets)==1:
             bets[0].entered_amount_yuan=float(stated)
             if cents(stated)!=cents(bets[0].principal):
-                bets[0].settlement_rule_pending.append('自报单笔金额与明确倍数计算不一致')
+                bets[0].source_span['customer_amount_discrepancy']={
+                    'declared':float(stated),'computed':bets[0].principal}
+                # The original multiplier is authoritative; a customer's
+                # wrong arithmetic is not a pending settlement rule.
     return bets
 
 
@@ -382,6 +398,8 @@ def decode_structured(source, candidate, parser, lottery):
     except (ValueError,TypeError,KeyError,EvidenceError) as exc:
         return [], (), ('AI结构化JSON无效：'+str(exc),), True
     good=[]
+    # Preserve atomic candidate boundaries for conservative recovery.
+    groups=[]
     # Check the source's number of identical purchases; do not double-book
     # AI-proposed rows merely because they share a legal ticket and play.
     used=Counter()
@@ -396,6 +414,7 @@ def decode_structured(source, candidate, parser, lottery):
                     raise EvidenceError('同一玩法号码出现次数不足，疑似AI重复生成')
                 accepted.append(b)
             good.extend(accepted)
+            groups.append((i+1, accepted))
             for b in accepted:
                 used[(b.play,b.selection,str(Decimal(str(b.multiplier)).normalize()))]+=1
         except (EvidenceError,ValueError,KeyError,TypeError,ArithmeticError) as exc:
@@ -403,10 +422,20 @@ def decode_structured(source, candidate, parser, lottery):
     if good:
         ok,why=validate_full(source,good,allow_unresolved=True)
         if not ok:
-            # Evidence-level corruption is unsafe for risk. Keep the
-            # original AI JSON for manual correction; never book it as valid.
+            # Do not let a corrupt group erase independently verified
+            # groups from other source spans. A group that depends on missing
+            # context or conflicting totals stays pending, never auto-booked.
             errors.append('证据总复核：'+why)
-            good=[]
+            recovered=[]
+            for original_index, group in groups:
+                independent_ok, independent_reason=validate_full(
+                    source, recovered+group, allow_unresolved=True)
+                if independent_ok:
+                    recovered.extend(group)
+                else:
+                    errors.append(
+                        f'第{original_index}项隔离待核对：{independent_reason}')
+            good=recovered
     needs_review=payload.get('needs_review') is True or bool(payload.get('uncertainties'))
     if isinstance(payload.get('uncertainties'),list):
         errors.extend(str(x)[:120] for x in payload['uncertainties'][:5])
@@ -449,6 +478,8 @@ def reconcile(source, raw_candidate, parser, lottery, local, pending, claimed=No
     """
     if not isinstance(raw_candidate,str) or not raw_candidate.lstrip().startswith('{'):
         return AIResult(list(local),list(pending),0,('AI必须返回结构化JSON，不能用改写文本直接入账',),False)
+    # V271: AI candidates must still be independently checked against source.
+    # Whole-message deterministic patterns are handled before AI in parser.py.
     ai,items,rejected,model_uncertain=decode_structured(source,raw_candidate,parser,lottery)
     if not ai:
         return AIResult(list(local),list(pending),0,rejected or ('AI未返回可验证投注',),False,'；'.join(rejected) if rejected else 'AI未返回可验证投注')
@@ -459,10 +490,12 @@ def reconcile(source, raw_candidate, parser, lottery, local, pending, claimed=No
     if complete:
         full_due=sum(cents(b.principal) for b in ai)
         grand=message_total(source)
-        if grand is not None and full_due!=cents(grand):
-            complete=False;missing='程序计算金额与自报合计不一致，需确认投注或金额'
-        if claimed is not None and full_due!=cents(claimed):
-            complete=False;missing='原始自报金额与AI计算金额不符'
+        from context_receipts_v271 import strong_receipt_evidence
+        receipt_typo=strong_receipt_evidence(source,ai)
+        if grand is not None and full_due!=cents(grand) and not receipt_typo:
+            complete=False;missing='程序计算金额与自报合计不一致，且投注尚未独立证实'
+        if claimed is not None and full_due!=cents(claimed) and not receipt_typo:
+            complete=False;missing='原始自报金额与AI计算金额不符，尚缺独立投注证据'
     # The AI must not rewrite an independently verified local purchase. A
     # complete source-backed AI ledger may replace only a tentative parse with
     # an exact matching whole-message total. Otherwise preserve local bets.
@@ -482,8 +515,10 @@ def reconcile(source, raw_candidate, parser, lottery, local, pending, claimed=No
     # mere presence of an AI response.
     filled,why=_observed(source,combined)
     grand=message_total(source)
+    from context_receipts_v271 import strong_receipt_evidence
     if filled and not rejected and not model_uncertain and (
         grand is None or sum(cents(b.principal) for b in combined)==cents(grand)
+        or strong_receipt_evidence(source,combined)
     ):
         unresolved=[]
     elif filled and grand is not None and sum(cents(b.principal) for b in combined)!=cents(grand):

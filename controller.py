@@ -264,6 +264,15 @@ class Controller:
         if not unresolved:
             return ''
         from evidence_v257 import source_segments
+        # The parent message is context only. If a person edited this color's
+        # current text, never reuse an obsolete original as betting evidence.
+        parent_text=record.source_original_text or record.raw_text
+        try:
+            split_parent=split_lottery_message(parent_text,record.lottery)
+            if split_parent.get(record.lottery,'') != record.raw_text:
+                parent_text=record.raw_text
+        except (ValueError,KeyError,TypeError):
+            parent_text=record.raw_text
         segments=source_segments(record.raw_text)
         scoped=[]
         for p in record.pending_fragments:
@@ -280,11 +289,18 @@ class Controller:
                            'local_confirmed':confirmed,
                            'local_confirmed_count':len(record.bets),
                            'local_confirmed_amount_yuan':sum(cents(b.principal) for b in record.bets)/100,
+                           'runtime_principal_yuan':{
+                               play:float(rule['principal']) for play,rule in
+                               self.parser_for_record(record).rules[record.lottery].items()},
                            'use_full_ai_interpretation':True,
-                           'original_message':record.source_original_text or record.raw_text,
-                           'instruction':'独立理解完整raw_text，local_confirmed仅作参考、不可作为语法限制；'
-                                         '必须解释全部有依据的投注并保留重复购买；使用真实segment_id，'
-                                         '不计算字符偏移，不得虚构号码/玩法/倍数，金额与倍数分开。'},
+                           'original_message':parent_text,
+                           'instruction':'先完整阅读original_message理解上下文，再根据raw_text和当前彩种输出全部投注；'
+                                         'original_message仅供跨行/跨彩种语义参照，正式原文source_segments的范围只对应raw_text；'
+                                         'local_confirmed仅供参考，不能限制AI解释，也不意味着再增加投注；'
+                                         '完整提取当前彩种的所有投注，允许结合原始消息共享明确玩法和金额；'
+                                         '金额仅用于在没有明确倍数时推算；明确倍数与客户尾数冲突时保留明确倍数，'
+                                         '将计算错误写入brief_reason；必须使用真实segment_id，'
+                                         '不得编造原文不存在的号码、玩法、倍数或重复下注。'},
                           ensure_ascii=False)
 
     def ai_text_for_record(self, record, allow_existing_candidate=False):
@@ -327,6 +343,13 @@ class Controller:
         parser = self.parser_for_record(record)
         text = self.settings.get('aliases', {}).get(record.raw_text.strip(), record.raw_text)
         bets, normalized, reason = parser.parse(record.lottery, text)
+        # V271: restore source-wide context for the exact original dual-lottery
+        # order; never apply it after an unrelated manual edit.
+        from context_receipts_v271 import parse_shared_context, strong_receipt_evidence
+        shared = parse_shared_context(parser, record.lottery, text,
+                                      record.source_original_text or '')
+        if shared is not None:
+            bets, normalized, reason = shared
         claimed = parser.last_claimed
         from amount_audit_v264 import audit_untyped_tail
         receipt_rows = list(getattr(parser, 'last_receipts', []) or [])
@@ -367,7 +390,9 @@ class Controller:
                         if cents(x['declared'])!=cents(x['computed'])]
         total_conflict=(claimed is not None and bets and not pending
                         and cents(claimed)!=sum(cents(b.principal) for b in bets))
-        if bets and not pending and (total_conflict or line_conflicts):
+        receipt_advisory = bool(bets and not pending and
+            (total_conflict or line_conflicts) and strong_receipt_evidence(text,bets))
+        if bets and not pending and (total_conflict or line_conflicts) and not receipt_advisory:
             computed=sum(cents(b.principal) for b in bets)/100
             provisional_due = sum(cents(b.principal) for b in bets)
             original_claimed=claimed
@@ -418,6 +443,12 @@ class Controller:
         if final_audit and final_audit['kind'] in ('count', 'ambiguous'):
             claimed, receipt_rows = final_audit['claimed'], final_audit['receipts']
             audit_note = final_audit
+        # Recompute after AI, because independently verified AI candidates may
+        # have corrected the provisional local wager interpretation.
+        receipt_advisory = bool(bets and not pending and
+            strong_receipt_evidence(text,bets) and (
+                claimed is not None and cents(claimed)!=sum(cents(b.principal) for b in bets)
+                or any(cents(x['declared'])!=cents(x['computed']) for x in receipt_rows)))
         record.bets = bets
         record.pending_fragments = pending
         record.issues = pending[:]
@@ -454,14 +485,29 @@ class Controller:
             else:record.note += '；AI独立证据校验通过'
         if record.claimed_amount is not None and bets and not pending:
             if cents(record.claimed_amount) != due:
-                record.note += f'；自报{record.claimed_amount:g}元，差额{(due-cents(record.claimed_amount))/100:g}元'
-                record.parse_status = 'amount_mismatch'
-                record.issues.append({'code':'amount_mismatch', 'ai_eligible':False,
-                                      'declared':record.claimed_amount, 'computed':due/100})
+                record.note += f'；客户自报{record.claimed_amount:g}元，程序应收{due/100:g}元，差额{(due-cents(record.claimed_amount))/100:g}元'
+                if receipt_advisory:
+                    record.parse_status = 'verified_receipt_discrepancy'
+                    record.issues.append({'code':'receipt_discrepancy', 'ai_eligible':False,
+                                          'declared':record.claimed_amount, 'computed':due/100,
+                                          'risk_counted':True})
+                else:
+                    record.parse_status = 'amount_mismatch'
+                    record.issues.append({'code':'amount_mismatch', 'ai_eligible':False,
+                                          'declared':record.claimed_amount, 'computed':due/100})
         for receipt in receipt_rows:
             if cents(receipt['declared'])!=cents(receipt['computed']):
-                record.issues.append({'code':'line_amount_mismatch','ai_eligible':False,**receipt})
-                if not pending:record.parse_status='amount_mismatch'
+                if receipt_advisory:
+                    record.issues.append({'code':'receipt_discrepancy','ai_eligible':False,
+                                          'risk_counted':True,**receipt})
+                    record.parse_status='verified_receipt_discrepancy'
+                else:
+                    record.issues.append({'code':'line_amount_mismatch','ai_eligible':False,**receipt})
+                    if not pending:record.parse_status='amount_mismatch'
+        if receipt_advisory and record.status == '已识别':
+            record.note += '；已按明确投注计入风险，客户尾数仅作差额提醒'
+            if record.review_status == 'manual_review_pending':
+                record.review_status = 'not_manually_reviewed'
         # Status and money verification are separate facts.
         # Never display '已识别/自动计入' while amount_mismatch is active.
         if record.parse_status == 'amount_mismatch':
@@ -531,14 +577,23 @@ class Controller:
             equal = due == cents(common_total)
             for x in parts:
                 x.note += ('；双彩共同合计已核对' if complete and equal else
-                           '；双彩共同合计有冲突，必须人工核对' if complete else
+                           '；双彩共同合计有差异，须按原文投注证据核对' if complete else
                            '；原文包含双彩共同合计，另一个彩种尚未完全识别')
                 x.note += f'（整条{common_total:g}元，当前两彩已确认{due/100:g}元）'
                 if complete and not equal:
-                    x.parse_status = 'amount_mismatch'
-                    x.status = '待确认'
-                    x.issues.append({'code':'shared_amount_mismatch', 'ai_eligible':False,
-                                     'declared':float(common_total), 'computed':due/100})
+                    from context_receipts_v271 import shared_cash_evidence
+                    cash_proven=all(shared_cash_evidence(
+                        self.parser_for_record(one),one.lottery,one.raw_text,
+                        one.source_original_text) for one in parts)
+                    if cash_proven:
+                        x.note += f'；客户整条合计填写错误，应收{due/100:g}元，差额{(due-cents(common_total))/100:g}元；已按明确各笔计入风险'
+                        x.issues.append({'code':'shared_receipt_discrepancy','ai_eligible':False,
+                                         'risk_counted':True,'declared':float(common_total),'computed':due/100})
+                    else:
+                        x.parse_status = 'amount_mismatch'
+                        x.status = '待确认'
+                        x.issues.append({'code':'shared_amount_mismatch', 'ai_eligible':False,
+                                         'declared':float(common_total), 'computed':due/100})
                 self.store.update(x, '双彩共同合计校验')
         return self.last_added_records[0] if self.last_added_records else None
 
