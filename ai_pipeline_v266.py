@@ -53,7 +53,7 @@ def _kind(kind, codes, fragment):
     names = {'DIRECT':'直选', '直':'直选', '单':'直选', '单选':'直选',
              'GROUP3':'组三（组选）', 'GROUP6':'组六（组选）',
              'GROUP3_PERM':'组三复式', 'GROUP6_PERM':'组六复式',
-             'DOUBLE_FLY':'双飞', '飞':'双飞', '组3':'组三（组选）',
+             'DOUBLE_FLY':'双飞', '组3':'组三（组选）',
              '组6':'组六（组选）', '组三组选':'组三（组选）',
              '组六组选':'组六（组选）'}
     kind = names.get(kind, kind)
@@ -105,9 +105,11 @@ def _has_local_multiplier(fragment,play,multiple):
     if multiple != multiple.to_integral_value():return False
     words={'一':1,'二':2,'两':2,'三':3,'四':4,'五':5,'六':6,
            '七':7,'八':8,'九':9,'十':10}
-    if '十' in fragment:
-        for suffix in ('单','直') if play=='直选' else ('组','组选') if '组选' in play else ():
-            for m in re.finditer(r'([一二两三四五六七八九十]+)'+suffix, fragment):
+    for suffix in ('单','直') if play=='直选' else ('组','组选') if '组选' in play else ():
+        for m in re.finditer(r'([一二两三四五六七八九十]+)\s*'+suffix, fragment):
+            if words.get(m[1])==int(multiple):return True
+        if suffix in ('组','组选'):
+            for m in re.finditer(suffix+r'\s*([一二两三四五六七八九十]+)', fragment):
                 if words.get(m[1])==int(multiple):return True
     return False
 
@@ -133,6 +135,102 @@ def _money_evidence(fragment, amount, play):
     return False
 
 
+
+# V267: business-confirmed per-ticket cash evidence, candidate-local normalization.
+def _v267_per_ticket_amount(fragment, play):
+    """Return explicitly priced Yuan per wager (never a multiplier).
+
+    '一米直一米组' is two independent unit-price declarations.
+    Does not borrow one play's amount to price another play.
+    """
+    text = fragment
+    words={'半':Decimal('0.5'),'一':Decimal('1'),'二':Decimal('2'),
+           '两':Decimal('2'),'三':Decimal('3'),'四':Decimal('4'),
+           '五':Decimal('5'),'六':Decimal('6'),'七':Decimal('7'),
+           '八':Decimal('8'),'九':Decimal('9'),'十':Decimal('10')}
+    family = (r'(?:直选|直|单)' if play=='直选' else
+              r'(?:组选|组[三六36]?)' if (
+                  play in ('组三（组选）','组六（组选）')) else None)
+    if family is None:return None
+    hits=list(re.finditer(r'(?P<n>半|一|二|两|三|四|五|六|七|八|九|十|\d+(?:\.\d{1,2})?)'
+                         r'\s*[米元块]\s*'+family, text))
+    if not hits:return None
+    values=[]
+    for match in hits:
+        n=match.group('n')
+        values.append(words[n] if n in words else Decimal(n))
+    return values[0] if values and len(set(values))==1 else None
+
+
+def _v267_cash_bound_to_other_code(fragment, play, codes, amount):
+    """Do not borrow '1369组六30' to price preceding '369四单一组'."""
+    family = ('直选','直','单','组六','组三','组选','组')
+    expression=(r'(?<!\d)(?P<selection>\d{3,9})\s*'
+                r'(?P<play>直选|直|单|组六|组三|组选|组)\s*'
+                r'(?P<price>\d+(?:\.\d{1,2})?)\s*(?:元|米|块)?(?!\d|\s*倍)')
+    matched=[]
+    for m in re.finditer(expression,fragment):
+        try:
+            if Decimal(m.group('price'))==amount:matched.append(m)
+        except ArithmeticError:
+            continue
+    # Only act when the amount is explicitly bound to a code-play pair.
+    # A group 1369组六30 cannot be assigned to 369直选 or 369组选.
+    if matched and not any(m.group('selection') in codes and
+        (('直' in m.group('play') or m.group('play')=='单') == (play=='直选'))
+        for m in matched):
+        return True
+    return False
+
+
+def _v267_normalize_input(source, raw):
+    """Normalize candidates independently. One malformed row cannot reject all."""
+    payload=json.loads(raw)
+    if not isinstance(payload,dict) or not isinstance(payload.get('candidate_bets'),list):
+        raise EvidenceError('没有 candidate_bets 数组')
+    good=[]; errors=[]
+    pos={'百':'百','百位':'百','hundred':'百','hundreds':'百',
+         '十':'十','十位':'十','ten':'十','tens':'十',
+         '个':'个','个位':'个','unit':'个','units':'个','ones':'个'}
+    for index,rawitem in enumerate(payload['candidate_bets'],1):
+        try:
+            if not isinstance(rawitem,dict):
+                raise EvidenceError('候选不是对象')
+            item=dict(rawitem)
+            positions=item.get('position_sets')
+            if isinstance(positions,dict):
+                mapped={}
+                for label,value in positions.items():
+                    k=pos.get(label)
+                    if not k or k in mapped:raise EvidenceError('定位位置重复或未知')
+                    if value is None or value=='':continue
+                    if isinstance(value,list):
+                        if not value or not all(isinstance(v,(str,int)) and
+                             len(str(v))==1 and str(v).isascii() and str(v).isdigit()
+                             for v in value):
+                            raise EvidenceError('定位列表必须是一位数字数组')
+                        value=''.join(str(v) for v in value)
+                    elif type(value) is int:
+                        value=str(value)
+                    elif not isinstance(value,str):
+                        raise EvidenceError('定位号码格式无效')
+                    if not value or not value.isascii() or not value.isdigit():
+                        raise EvidenceError('定位号码格式无效')
+                    mapped[k]=value
+                item['position_sets']=mapped
+            normalized=normalize_candidate(source,json.dumps(
+                {'candidate_bets':[item]},ensure_ascii=False))
+            group=json.loads(normalized)['candidate_bets']
+            good.extend(group)
+        except (ValueError,TypeError,KeyError,ArithmeticError,EvidenceError) as exc:
+            errors.append(f'第{index}项字段规范化失败：{exc}')
+    return payload,good,errors
+
+
+def _v267_mentions_count(source,code):
+    return len(re.findall(r'(?<!\d)'+re.escape(str(code))+r'(?!\d)',source))
+
+
 def _one_candidate(item, parser, lottery, source):
     if not isinstance(item,dict):raise EvidenceError('候选必须是JSON对象')
     target=item.get('lottery',lottery)
@@ -144,6 +242,16 @@ def _one_candidate(item, parser, lottery, source):
     first=codes[0] if len(codes[0])==3 and codes[0].isdigit() else ''
     start,end,region=locate_evidence(source,item,first)
     play=_kind(item.get('bet_type') or item.get('play'),codes,region)
+    # Declared ticket count must not turn 3 named selections into 4 bets.
+    # Retain raw AI candidate for manual review, but reject automatic ledger entry.
+    matched_count=re.search(r'(?:直选|直|单)\s*(\d+)\s*注',region)
+    if (matched_count and all(len(code)==3 and code.isdigit() for code in codes)
+            and len(codes)<int(matched_count.group(1))):
+        raise EvidenceError('声明'+matched_count.group(1)+'注，实际仅'+str(len(codes))+
+                            '个号码；AI候选保留待人工确认，不自动入账')
+    # 单独的‘飞10’不构成明确双飞，数字10也不能无单位直接用作倍数。
+    if play=='双飞' and not re.search(r'双飞',region):
+        raise EvidenceError('飞的玩法及金额/倍数需要更多上下文，不能自动认定双飞')
     if play in ('和值','跨度'):
         codes=[str(int(code)) for code in codes]
     amount=item.get('declared_amount_yuan',item.get('amount'))
@@ -166,7 +274,15 @@ def _one_candidate(item, parser, lottery, source):
         mult=_number(multiple,'倍数')
     else:
         if amount is None:raise EvidenceError('金额不能为空')
-        mult=_number(amount,'金额')/cost
+        stated=_number(amount,'金额')
+        per_ticket=_v267_per_ticket_amount(region,play)
+        if per_ticket is not None:
+            computed=per_ticket*len(codes)
+            if stated!=computed:
+                raise EvidenceError('每笔金额与本组号码数量不符：应为'+str(computed)+'元')
+        elif _v267_cash_bound_to_other_code(region,play,codes,stated):
+            raise EvidenceError('该金额属于原文另一组选号，不能跨组分配')
+        mult=stated/cost
     mult=parser._multiplier(format(mult,'f'))
     bets=[parser._make(lottery,region,b.play,b.selection,mult) for b in base]
     for b in bets:
@@ -186,7 +302,12 @@ def _one_candidate(item, parser, lottery, source):
             if not _has_local_multiplier(region,b.play,Decimal(str(mult))):
                 raise EvidenceError('倍数没有原文证据：'+str(mult))
         else:
-            mention=_money_evidence(region,_number(amount,'金额'),b.play)
+            unit=_v267_per_ticket_amount(region,b.play)
+            mention=(unit is not None and unit*len(codes)==_number(amount,'金额'))
+            if not mention:
+                if _v267_cash_bound_to_other_code(region,b.play,codes,_number(amount,'金额')):
+                    raise EvidenceError('金额属于其他原文选号，不能跨组取用：'+str(amount))
+                mention=_money_evidence(region,_number(amount,'金额'),b.play)
             if not mention:raise EvidenceError('金额没有原文证据：'+str(amount))
             # Converting a bare value into a multiple requires a complete total.
             # A numerical "1直1组" does NOT establish a monetary per-bet price.
@@ -194,6 +315,12 @@ def _one_candidate(item, parser, lottery, source):
                 raise EvidenceError('无单位金额需要整单合计佐证')
         b.source_span={'start':start,'end':end,'text':region,
                        'position_verified':True, 'segment_id':item.get('segment_id')}
+        if mode=='amount':
+            unit=_v267_per_ticket_amount(region,b.play)
+            if unit is not None and unit*len(codes)==_number(amount,'金额'):
+                b.source_span['amount_evidence']='per_ticket_unit_price'
+                b.source_span['unit_amount_yuan']=float(unit)
+                b.source_span['derived_group_amount_yuan']=float(_number(amount,'金额'))
         b.parse_source='ai_evidence_verified'
     if mode=='multiplier' and amount is not None:
         stated=_number(amount,'金额')
@@ -251,24 +378,33 @@ def _observed(source, bets):
 
 def decode_structured(source, candidate, parser, lottery):
     try:
-        normalized=normalize_candidate(source,candidate)
-        payload=json.loads(normalized)
-        items=payload.get('candidate_bets')
-        if not isinstance(items,list):raise EvidenceError('没有 candidate_bets 数组')
+        payload,items,errors=_v267_normalize_input(source,candidate)
     except (ValueError,TypeError,KeyError,EvidenceError) as exc:
         return [], (), ('AI结构化JSON无效：'+str(exc),), True
-    good=[];errors=[]
+    good=[]
+    # Check the source's number of identical purchases; do not double-book
+    # AI-proposed rows merely because they share a legal ticket and play.
+    used=Counter()
     for i,item in enumerate(items):
         try:
             bets=_one_candidate(item,parser,lottery,source)
-            good.extend(bets)
+            accepted=[]
+            for b in bets:
+                key=(b.play,b.selection,str(Decimal(str(b.multiplier)).normalize()))
+                if (b.selection.isascii() and b.selection.isdigit()
+                        and _v267_mentions_count(source,b.selection)<used[key]+1):
+                    raise EvidenceError('同一玩法号码出现次数不足，疑似AI重复生成')
+                accepted.append(b)
+            good.extend(accepted)
+            for b in accepted:
+                used[(b.play,b.selection,str(Decimal(str(b.multiplier)).normalize()))]+=1
         except (EvidenceError,ValueError,KeyError,TypeError,ArithmeticError) as exc:
             errors.append(f'第{i+1}项：{exc}')
     if good:
         ok,why=validate_full(source,good,allow_unresolved=True)
         if not ok:
-            # Partial candidate validation must not silently approve an unsafe
-            # ledger; fail closed, retain errors for display.
+            # Evidence-level corruption is unsafe for risk. Keep the
+            # original AI JSON for manual correction; never book it as valid.
             errors.append('证据总复核：'+why)
             good=[]
     needs_review=payload.get('needs_review') is True or bool(payload.get('uncertainties'))
@@ -281,7 +417,7 @@ def _key(b):
     return b.play,b.selection,str(Decimal(str(b.multiplier)).normalize())
 
 
-def _combine(local, ai):
+def _combine(local, ai, source):
     """Use source overlapping + ledger identity; do not discard repeat purchases."""
     result=list(local)
     matched=set()
@@ -291,6 +427,10 @@ def _combine(local, ai):
         skip=False
         for i,old in enumerate(local):
             if i in matched or _key(item)!=_key(old):continue
+            # When a ticket appears only once in the source, local and AI
+            # cannot both book it as two purchases irrespective of spans.
+            if _v267_mentions_count(source,item.selection)==1:
+                matched.add(i);skip=True;break
             other=old.source_span or {}
             a,b=span.get('start'),span.get('end')
             c,d=other.get('start'),other.get('end')
@@ -335,7 +475,7 @@ def reconcile(source, raw_candidate, parser, lottery, local, pending, claimed=No
         or any(x.get('code') in ('amount_mismatch','line_amount_mismatch') for x in pending)
     ):
         return AIResult(ai,[],len(ai),(),True,'完整证据及整单金额覆盖暂算结果')
-    combined,additions=_combine(local,ai)
+    combined,additions=_combine(local,ai,source)
     unresolved=list(pending)
     # When all source bets are covered by combined ledger, clear original parser
     # errors even if original syntax could not be parsed. Never clear due to the
@@ -352,3 +492,5 @@ def reconcile(source, raw_candidate, parser, lottery, local, pending, claimed=No
         unresolved=list(pending)
     detail='；'.join(list(rejected)[:6]+([missing] if missing else []))
     return AIResult(combined,unresolved,len(additions),rejected,bool(not unresolved),detail)
+
+# V267-AI-LEDGER-20261103

@@ -37,6 +37,46 @@ def _matches_final_receipt(receipt, value, raw):
     return False
 
 
+
+
+def reconcile_terminal_shared_total(source, bets, claimed, receipts):
+    """Correct terminal 共N assigned to just the last group by a split parser.
+
+    Strict positive proof: total equals ALL computed bets; the erroneous
+    receipt points at the last subgroup only; source contains independent bet
+    spans before it. Any ambiguous or mismatching case keeps its review flag.
+    Return (claimed, receipts, changed). Never creates/reprices bets.
+    """
+    if not isinstance(source,str) or not bets or not receipts:
+        return claimed,list(receipts or ()),False
+    match=re.search(r'(?:[，,。;；\s])共\s*[:：]?\s*(\d+(?:\.\d{1,2})?)\s*[元米块]\s*$',source)
+    if not match:return claimed,list(receipts),False
+    stated=_dec(match.group(1))
+    due=sum((_dec(getattr(b,'principal',None)) or Decimal(0) for b in bets),Decimal(0))
+    if stated is None or due != stated or stated<=0:
+        return claimed,list(receipts),False
+    spans=set()
+    for bet in bets:
+        span=getattr(bet,'source_span',None) or {}
+        if type(span.get('start')) is int and type(span.get('end')) is int:
+            spans.add((span['start'],span['end']))
+    if len(spans)<2:
+        return claimed,list(receipts),False
+    removed=[];kept=[]
+    for receipt in receipts:
+        content=str(receipt.get('text') or '')
+        bad_scope=(content and re.search(r'(?:[，,。;；\s])共\s*[:：]?\s*'+
+                              re.escape(match.group(1))+r'\s*[元米块]\s*$',content)
+                   and _dec(receipt.get('declared'))==stated
+                   and _dec(receipt.get('computed'))!=stated)
+        if bad_scope:removed.append(receipt)
+        else:kept.append(receipt)
+    if len(removed)!=1:
+        return claimed,list(receipts),False
+    if claimed is not None and _dec(claimed)!=stated:
+        return claimed,list(receipts),False
+    return float(stated),kept,True
+
 def audit_untyped_tail(raw, bets, claimed, receipts):
     """Return None for no evidence, else outcome with money/row adjustments.
 

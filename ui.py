@@ -563,6 +563,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
             ('当前数据 CSV', self.export_csv),
             ('投注明细 CSV', self.export_detail_csv),
             ('结构化 JSON', self.export_contract_json),
+            ('识别诊断 JSON（含AI历史）', self.export_diagnostics_json),
             ('截止汇总 JSON', self.export_batch_json),
         ]:
             self.export_menu.add_command(label=text, command=action)
@@ -1025,9 +1026,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
             maximum = max((cents(p)-self.snapshot.revenue for p in self.snapshot.payouts.values()), default=0)
             for name, value in [('due', money(self.snapshot.principal)+'元'), ('income', money(self.snapshot.revenue)+'元'), ('risk', str(len(self.snapshot.risks))), ('loss', money(max(0, maximum))+'元')]:
                 self.cards[name].configure(text=value)
-            text = plan_text(self.snapshot.risks, self.controller.settings['direct_unit_cost'][lottery])
+            text = plan_text(self.snapshot.risks,
+                             self.controller.settings['direct_unit_cost'][lottery], lottery)
             if self.snapshot.pending:
-                text = '当前统计不完整，以下仅供核对已验证部分，不能作为最终补单方案。\n'+text
+                text = ('[仅供人工核对 / 不可作为正式补单依据]\n'
+                        '当前统计不完整，存在未确认投注；不得直接按此方案下注。\n\n'+text)
             self.set_text(self.plan, text)
             note = '已计入全部补单成本' if self.controller.settings['include_hedge_cost'] else '倍数计算忽略补单成本'
             self.plan_note.configure(text=note)
@@ -1048,7 +1051,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
             if self.store.import_errors:
                 warnings.append('部分旧数据迁入失败，请检查原文件。')
             self.warning.configure(text='  '.join(warnings) or '当前有效投注已完成计算。', fg=RED if warnings else MUTED)
-            self.copy_button.configure(state='normal' if not self.snapshot.pending and any(r.plan_multiplier for r in self.snapshot.risks) else 'disabled')
+            self.copy_button.configure(text=('复制核对草稿' if self.snapshot.pending else '一键复制'),
+                                       state='normal' if any(r.plan_multiplier for r in self.snapshot.risks) else 'disabled')
         except (ValueError, KeyError, sqlite3.Error) as exc:
             self.snapshot = None
             self.error = str(exc)
@@ -1517,7 +1521,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
             lines.append(f'客户自报金额：{record.claimed_amount:g}元')
         lines.append('\n逐笔明细：')
         lines.extend(f'{b.selection} {b.play} {b.multiplier}倍，应收{b.principal:g}元' for b in record.bets)
-        lines.append('AI任务状态：'+({'queued':'AI排队中','started':'AI识别中','responded':'AI已返回','failed':'识别失败','unknown_billing':'网络超时，计费不明'}.get(record.ai_request_state,'未运行')))
+        lines.append('AI任务状态：'+({'queued':'AI排队中','started':'AI识别中','responded':'AI已返回','failed':'识别失败','unknown_billing':'网络超时，计费不明','manual_saved':'人工保存，未重新调用AI'}.get(record.ai_request_state,'未运行')))
         timed = next((h for h in reversed(record.ai_history) if isinstance(h,dict) and isinstance(h.get('timings'),dict)),None)
         if timed:
             t=timed['timings']
@@ -1561,11 +1565,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
                     return
                 self.controller.edit(record, text.get('1.0', 'end-1c'), amount)
                 self.refresh()
-                self.queue_ai(record)
-                win.destroy()
+                win.destroy()  # 人工保存，不发AI
             except (ValueError, OSError, sqlite3.Error) as exc:
                 self.fail(exc)
-        ttk.Button(win, text='保存并重算', style='Accent.TButton', command=save).pack(pady=16)
+        ttk.Button(win, text='保存修改（不重新提交AI）', style='Accent.TButton', command=save).pack(pady=16)
 
     def copy_context_raw(self):
         record = self.context_record()
@@ -1593,6 +1596,34 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self.records_tree.clear_selection()
             self.refresh()
         except (sqlite3.Error, ValueError) as exc:
+            self.fail(exc)
+
+    def verify_selected_locally(self):
+        """Explicit local revalidation; preserve candidate and never enqueue AI."""
+        records=self.selected_records()
+        if not records:
+            return
+        if any(r.record_id in self.ai_busy for r in records):
+            messagebox.showinfo('任务正在处理','有AI请求正在执行，不能同时重核。',parent=self)
+            return
+        if not messagebox.askyesno('仅本地重核',
+                f'用当前本地规则重算 {len(records)} 条；不重新发送AI，保留历史与实收。确定继续？',
+                parent=self):
+            return
+        try:
+            for old in records:
+                current=self.store.get(old.record_id)
+                if not current:continue
+                current.revision+=1
+                self.controller.parse_record(current)
+                current.ai_request_state='manual_saved'
+                if current.status!='已识别' and current.review_status=='manually_confirmed':
+                    current.review_status='manual_review_pending'
+                current.ai_history.append({'action':'explicit_local_recheck_no_ai',
+                                           'at':now().isoformat()})
+                self.store.update(current,'仅本地重新核算（不发送AI）')
+            self.refresh()
+        except (ValueError,KeyError,ArithmeticError,sqlite3.Error) as exc:
             self.fail(exc)
 
     def reparse_record(self):
@@ -1725,6 +1756,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         menu.add_separator()
         menu.add_command(label='复制选中原始数据', command=self.copy_selected_raw)
         menu.add_command(label='重新识别选中数据'+self.shortcut_label('reparse'), command=self.reparse_selected)
+        menu.add_command(label='仅本地重核所选（不调用AI）', command=self.verify_selected_locally)
         menu.add_command(label='AI转换选中数据'+self.shortcut_label('ai_convert'), command=self.ai_selected)
         menu.add_separator()
         menu.add_command(label='删除当前数据', command=self.delete_current_record, foreground=RED, state='normal' if has_current else 'disabled')
@@ -1737,6 +1769,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
         if record:
             record = self.store.get(record.record_id)
         if not record:return
+        if not force and record.ai_request_state=='manual_saved':
+            return  # 旧异步任务、自动扫描不得重发人工已保存的记录
         if record.record_id in self.ai_busy:
             if force and hasattr(self,'add_feedback'):
                 self.add_feedback.configure(text='该条AI任务正在排队或识别中，请勿重复提交',foreground=ORANGE)
@@ -1943,7 +1977,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                                            else 'AI候选未通过本地复核，原文仍保留')
                             self.store.update(latest, '截止拦截AI结果')
                         if latest and latest.revision != revision:
-                            self.queue_ai(latest)
+                            pass  # 旧AI回包已过期，人工修改后不得重新发AI
                         elif latest and not was_manual and self.controller.settings['ai'].get('auto_retry_invalid',False) and self._retry_invalid_ai_once(record_id):
                             # 只自动再试一次；不让失败候选在程序重启后反复扣费。
                             dirty = True
@@ -1971,7 +2005,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                             self.after(10, lambda detail=reason: self.show_ai_error_detail(detail))
                         dirty = True
                     elif record and record.revision != revision:
-                        self.queue_ai(record)
+                        pass  # 旧AI失败事件已过期，不得自动重新发AI
                 elif event[0] == 'risk_ready':
                     _,generation,snapshot,error = event
                     self._risk_running = False
@@ -2124,10 +2158,17 @@ class RiskApp(ShortcutMixin, tk.Tk):
         ttk.Button(root, text='关闭', command=win.destroy).pack(anchor='e', pady=(9, 0))
 
     def copy_plan(self):
-        if not self.snapshot or self.snapshot.pending or self._risk_running or self._risk_next:
+        if not self.snapshot or self._risk_running or self._risk_next:
+            return
+        if not any(r.plan_multiplier for r in self.snapshot.risks):
+            return
+        # Copy the displayed text, never a hidden unmarked official plan.
+        # On unresolved orders this contains the mandatory draft warning.
+        text = self.plan.get('1.0', 'end-1c')
+        if self.snapshot.pending and '[仅供人工核对 / 不可作为正式补单依据]' not in text:
             return
         self.clipboard_clear()
-        self.clipboard_append(plan_text(self.snapshot.risks, self.controller.settings['direct_unit_cost'][self.lottery.get()]))
+        self.clipboard_append(text)
         self.update_idletasks()
         self.copy_button.configure(text='已复制')
         if self._copy_timer:
@@ -2140,7 +2181,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def _reset_copy_button(self):
         self._copy_timer = None
         if not self._closing and self.copy_button.winfo_exists():
-            self.copy_button.configure(text='一键复制')
+            self.copy_button.configure(text=('复制核对草稿' if self.snapshot and self.snapshot.pending else '一键复制'))
 
     def export_csv(self):
         destination = filedialog.asksaveasfilename(parent=self, title='导出当前数据', defaultextension='.csv', initialfile=f'{self.lottery.get()}_{self.controller.period}.csv', filetypes=[('CSV表格', '*.csv')])
@@ -2215,6 +2256,63 @@ class RiskApp(ShortcutMixin, tk.Tk):
             with open(destination, 'w', encoding='utf-8') as handle:
                 json.dump(batch, handle, ensure_ascii=False, indent=2)
         except OSError as exc:
+            self.fail(exc)
+
+    def export_diagnostics_json(self):
+        """Read-only diagnosis of current period & lottery, no API keys/settings."""
+        destination = filedialog.asksaveasfilename(
+            parent=self, title='导出识别诊断（AI候选、人工修订记录）',
+            defaultextension='.json',
+            initialfile=f'{self.lottery.get()}_{self.controller.period}_识别诊断.json',
+            filetypes=[('JSON', '*.json')])
+        if not destination:
+            return
+        try:
+            records=[r for r in self.controller.records()
+                     if r.lottery==self.lottery.get()]
+            messages=[]
+            for record in records:
+                history=[]
+                for row in self.store.record_history(record.record_id):
+                    before=row.get('before') or {}
+                    after=row.get('after') or {}
+                    history.append({'timestamp':row.get('timestamp'),
+                                    'action':row.get('action'),
+                                    'before_revision':before.get('revision'),
+                                    'after_revision':after.get('revision'),
+                                    'before_status':before.get('status'),
+                                    'after_status':after.get('status'),
+                                    'before_bets':before.get('bets',[]),
+                                    'after_bets':after.get('bets',[]),
+                                    'before_ai_candidate':before.get('ai_candidate',''),
+                                    'after_ai_candidate':after.get('ai_candidate','')})
+                messages.append({'record_id':record.record_id,
+                    'received_at':record.created_at,
+                    'raw_text':record.source_original_text or record.raw_text,
+                    'current_text':record.raw_text,
+                    'parse_status':record.parse_status,
+                    'review_status':record.review_status,
+                    'ai_request_state':record.ai_request_state,
+                    'status':record.status,
+                    'claimed_amount':record.claimed_amount,
+                    'computed_amount_yuan':record.computed_amount_yuan,
+                    'current_bets':[b.to_dict() for b in record.bets],
+                    'pending_fragments':record.pending_fragments,
+                    'issues':record.issues,
+                    'note':record.note,
+                    'ai_candidate':record.ai_candidate,
+                    'ai_history':record.ai_history,
+                    'record_revisions':history})
+            result={'schema_version':'v268-diagnostics-1',
+                    'lottery':self.lottery.get(),
+                    'period':self.controller.period,
+                    'messages':messages,
+                    'notice':'诊断包含原文及发送内容，请确认没有不希望分享的隐私信息。'}
+            with open(destination,'w',encoding='utf-8') as handle:
+                json.dump(result,handle,ensure_ascii=False,indent=2)
+            messagebox.showinfo('导出完成',
+                f'识别诊断已导出 {len(messages)} 条。发送前请检查原文中的隐私信息。', parent=self)
+        except (OSError,ValueError,KeyError,sqlite3.Error) as exc:
             self.fail(exc)
 
     def export_contract_json(self):
@@ -2659,6 +2757,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         for title, action in [('导出当前数据 CSV', self.export_csv),
                               ('导出逐笔明细 CSV', self.export_detail_csv),
                               ('导出结构化 JSON', self.export_contract_json),
+                              ('导出识别诊断 JSON', self.export_diagnostics_json),
                               ('导出截止汇总 JSON', self.export_batch_json)]:
             ttk.Button(data_page, text=title, command=action).pack(anchor='w', fill='x', pady=4)
         ttk.Separator(data_page).pack(fill='x', pady=(15, 11))
@@ -2862,3 +2961,5 @@ class RiskApp(ShortcutMixin, tk.Tk):
 # V264-20261102-AMOUNT-AUDIT
 
 # V265-20261102-AUTO-RECOGNIZE-SAFE-RETRY
+
+# V267-UI-20261103

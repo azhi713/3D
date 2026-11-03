@@ -296,7 +296,7 @@ class Controller:
             return ''  # 无选号数字的纯聊天，不花费模型请求去编造投注。
         if record.ai_candidate and not allow_existing_candidate:
             return ''  # 已有AI候选待审，禁止重启后反复发送并重复扣费。
-        if record.ai_request_state in ('started','unknown_billing') and not allow_existing_candidate:
+        if record.ai_request_state in ('started','unknown_billing','manual_saved') and not allow_existing_candidate:
             return ''
         from recognition_policy import classify_fragment
         policy=classify_fragment(record.raw_text)
@@ -330,6 +330,13 @@ class Controller:
         claimed = parser.last_claimed
         from amount_audit_v264 import audit_untyped_tail
         receipt_rows = list(getattr(parser, 'last_receipts', []) or [])
+        from amount_audit_v264 import reconcile_terminal_shared_total
+        claimed, receipt_rows, terminal_shared_total = reconcile_terminal_shared_total(
+            text, bets, claimed, receipt_rows)
+        if terminal_shared_total:
+            # Parser's prior line warning was caused by the same false scope.
+            parser.last_warnings = [w for w in getattr(parser,'last_warnings',[]) if
+                 not str(w).startswith('行金额不一致：')]
         audit_note = None
         provisional_due = None
         audit = audit_untyped_tail(text, bets, claimed, receipt_rows)
@@ -554,15 +561,32 @@ class Controller:
         if received is not None:
             cents(received)
         record.source_original_text = record.source_original_text or record.raw_text
+        # An unchanged text is a review action, not a new bet or new AI request.
+        # Do not wipe the model's earlier structured explanation on save.
+        if record.raw_text == text and record.received_amount == received:
+            record.revision += 1  # Invalidate old in-flight AI result.
+            if record.status != '已识别':
+                record.review_status = 'manual_review_pending'
+            record.ai_request_state = 'manual_saved'
+            record.ai_history.append({'action':'manual_review_saved_unchanged',
+                                      'at':now().isoformat()})
+            self.store.update(record, '人工核对原文未更改：保留已有候选与明细')
+            return
         record.raw_text = text
         record.received_amount = received
+        if record.ai_candidate:
+            record.ai_history.append({'action':'manual_edit_previous_candidate',
+                                      'at':now().isoformat(),
+                                      'previous_candidate':record.ai_candidate})
         record.ai_candidate = ''
         record.ai_request_state = ''
         record.revision += 1
         self.parse_record(record)
         record.review_status = ('manually_confirmed' if record.status=='已识别'
-                                and record.parse_status!='amount_mismatch' else 'not_manually_reviewed')
-        self.store.update(record, '人工修改')
+                                and record.parse_status!='amount_mismatch' else 'manual_review_pending')
+        record.ai_request_state = 'manual_saved'  # 保存编辑≠自动提交AI
+        record.ai_history.append({'action':'manual_save_no_auto_ai','at':now().isoformat()})
+        self.store.update(record, '人工修改保存（不重新提交AI）')
 
     def reparse(self, record):
         # User-requested retry must not be blocked by the previous AI
@@ -950,3 +974,5 @@ class Controller:
 # V264-20261102-AMOUNT-AUDIT
 
 # V265-20261102-AUTO-RECOGNIZE-SAFE-RETRY
+
+# V267-CONTROLLER-20261103

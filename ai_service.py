@@ -257,6 +257,13 @@ class AIService:
                          '金额字段是该candidate_bets项全部号码的总金额，而不是每注金额；'
                          '同一号码重复购买必须逐次表达；不准编造号码、玩法、金额、倍数；'
                          '无法确定的子项列入uncertainties，仍返回可确定的候选。')
+        # 仅拼接识别协议，不覆盖用户设置中已保存的自定义提示词。
+        instructions += ('\nV2.6.7业务口径：双飞/飞必须依据完整上下文，不能单凭“福17飞10”假设10倍或10元；'
+                         '“一米直一米组”是直选每个号码1元、组选每个号码1元，不是1倍；'
+                         '候选declared_amount_yuan是该候选号码列表的分组金额，'
+                         '由每注1元乘号码数推导的小计须标明amount_type=inferred，'
+                         '只有原文明示金额才标explicit。四码及以上组合金额不能借给前面的其他投注。'
+                         '号码数量与声明注数冲突时，保留候选号码与uncertainties，不得杜撰缺失号码。')
         # V257-RECEIPT-FOLLOWUP-20261101: deterministic receipt-backed candidates first.
         # Still validated by the normal period-specific candidate pipeline.
         from receipt_inference_v257 import infer_receipt_candidates
@@ -289,3 +296,5 @@ class AIService:
 # V260-20261101-RC1
 
 # V262-20261101-CUSTOMER-TRANSPORT
+
+# V267-PROMPT-20261103

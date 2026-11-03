@@ -142,10 +142,24 @@ class RiskEngine:
         return sorted(rows, key=lambda row: -row['payout'])
 
 
-def plan_text(rows, unit_cost=2):
-    items = [f'{row.number}直选{row.plan_multiplier}倍' for row in rows if row.plan_multiplier > 0]
-    if not items:
+def plan_text(rows, unit_cost=2, lottery='福彩'):
+    """Display only. Group identical multiples; leave risk arithmetic unchanged."""
+    from collections import defaultdict
+    from decimal import Decimal
+    groups = defaultdict(list)
+    for row in rows:
+        if Decimal(str(row.plan_multiplier)) > 0:
+            groups[Decimal(str(row.plan_multiplier))].append(str(row.number))
+    if not groups:
         return '暂无需要补单的号码'
-    lines = ['  '.join(items[i:i+4]) for i in range(0, len(items), 4)]
-    lines.append('合计：'+money(sum(row.plan_multiplier for row in rows)*cents(unit_cost))+'元')
-    return '\n'.join(lines)
+    prefix = '体' if lottery in ('体彩', '体彩排列三', '排') else '福'
+    paragraphs = []
+    for multiplier in sorted(groups, reverse=True):
+        amount = format(multiplier, 'f').rstrip('0').rstrip('.') if multiplier % 1 else str(int(multiplier))
+        numbers = groups[multiplier]
+        lines = [prefix+'直选'+amount+'倍']
+        lines += ['  '.join(numbers[i:i+12]) for i in range(0,len(numbers),12)]
+        paragraphs.append('\n'.join(lines))
+    cost = sum((Decimal(str(row.plan_multiplier)) for row in rows if row.plan_multiplier>0),Decimal(0))
+    total_cents = cost * Decimal(cents(unit_cost))
+    return '\n\n'.join(paragraphs) + '\n\n合计：' + money(total_cents) + '元'

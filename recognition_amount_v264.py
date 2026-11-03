@@ -32,10 +32,84 @@ def _due(bets):
     return sum((Decimal(str(b.principal)) for b in bets),Decimal('0'))
 
 
+
+def _v268_exact_amount_groups(parser, lottery, text, original):
+    from decimal import Decimal
+    from recognition_v265 import _num
+    def by_cash(code, play, amount):
+        base=parser._from_kind(lottery,original,code,play,1)
+        if len(base)!=1:raise ValueError('组合展开异常')
+        unit=Decimal(str(base[0].principal))
+        if unit<=0:raise ValueError('单倍本金无效')
+        multiplier=Decimal(str(amount))/unit
+        if multiplier<=0:raise ValueError('金额不能为0')
+        mult=parser._multiplier(format(multiplier,'f'))
+        bets=parser._from_kind(lottery,original,code,play,mult)
+        if sum(Decimal(str(b.principal)) for b in bets)!=Decimal(str(amount)):
+            raise ValueError('金额不能整倍核算')
+        return bets
+
+    # Example: 640-660-600-606福1直1组打1米 8.
+    one=re.fullmatch(r'\s*(?P<lot_before>福彩|福|体彩|体)?\s*'
+        r'(?P<codes>\d{3}(?:[\s,，、/\-]+\d{3})+)\s*'
+        r'(?P<lot_after>福彩|福|体彩|体)?\s*1\s*直\s*1\s*组\s*打\s*1\s*[元米块]\s*'
+        r'(?P<total>\d+(?:\.\d{1,2})?)\s*[元米块]?\s*',text)
+    if one:
+        label=one['lot_before'] or one['lot_after']
+        if label and not _lottery_matches(label,lottery):return None
+        nums=re.findall(r'(?<!\d)\d{3}(?!\d)',one['codes'])
+        if Decimal(one['total']) != Decimal(2*len(nums)):
+            return None  # Never reconcile an inconsistent receipt by guessing.
+        try:
+            bets=[]
+            for code in nums:
+                bets.extend(by_cash(code,'直选',1))
+                bets.extend(by_cash(code,'组选',1))
+            total=sum(Decimal(str(b.principal)) for b in bets)
+            if total != Decimal(one['total']):return None
+        except (ValueError, KeyError, ArithmeticError):return None
+        parser.last_claimed=float(total)
+        parser.last_receipts=[]
+        parser.last_warnings=[]
+        return bets,parser.normalize_text(original),''
+
+    # Entire order + total uniquely disambiguate numeric group/fly amounts.
+    fly=re.fullmatch(r'\s*(?P<lot>福彩|福)?\s*(?P<main>\d{3})\s*'
+         r'(?P<direct>[一二两三四五六七八九十\d]+)\s*单\s*'
+         r'(?P<group>[一二两三四五六七八九十\d]+)\s*组\s*'
+         r'(?P<pool>\d{4,9})\s*组六\s*(?P<poolcash>\d+(?:\.\d{1,2})?)\s*'
+         r'[。.,，;；\s]+(?P<flycodes>\d{2}(?:[\s,、，\-]+\d{2})+)\s*'
+         r'双飞\s*(?P<flycash>\d+(?:\.\d{1,2})?)\s*'
+         r'(?:合计|总计)\s*(?P<total>\d+(?:\.\d{1,2})?)\s*[元米块]?\s*',text)
+    if fly:
+        if fly['lot'] and not _lottery_matches(fly['lot'],lottery):return None
+        try:
+            nums=re.findall(r'(?<!\d)\d{2}(?!\d)',fly['flycodes'])
+            bets=[]
+            bets.extend(parser._from_kind(lottery,original,fly['main'],'直选',
+                                          parser._multiplier(str(_num(fly['direct'])))))
+            bets.extend(parser._from_kind(lottery,original,fly['main'],'组选',
+                                          parser._multiplier(str(_num(fly['group'])))))
+            bets.extend(by_cash(fly['pool'],'组六',Decimal(fly['poolcash'])))
+            for code in nums:
+                bets.extend(by_cash(code,'双飞',Decimal(fly['flycash'])))
+            total=sum(Decimal(str(b.principal)) for b in bets)
+            if total != Decimal(fly['total']):return None
+        except (ValueError,KeyError,ArithmeticError):return None
+        parser.last_claimed=float(total)
+        parser.last_receipts=[]
+        parser.last_warnings=[]
+        return bets,parser.normalize_text(original),''
+    return None
+
+
 def parse_amount_v264(parser,lottery,text):
     if not isinstance(text,str) or not text.strip():return None
     raw=unicodedata.normalize('NFKC',text).replace('㊗️','注').replace('㊗','注').replace('祝️','注')
     normalized=parser.normalize_text(text)
+    exact=_v268_exact_amount_groups(parser,lottery,raw,text)
+    if exact is not None:
+        return exact
     batch=BATCH.fullmatch(raw)
     if batch:
         if not _lottery_matches(batch['lot'],lottery):return None
