@@ -2,8 +2,8 @@
 from copy import deepcopy
 
 APP_NAME = "彩票实时风险预警"
-APP_VERSION = "V2.6.5-自动识别与安全重试"
-ENGINE_VERSION = "V2.6.5-auto-recognize-safe-retry"
+APP_VERSION = "V2.6.6-AI独立识别与证据校验"
+ENGINE_VERSION = "V2.6.6-independent-ai-evidence"
 RULES_VERSION = "2026-10-26-catalog+2026-10-31-overlay-v2"
 
 LOTTERY_FC = "福彩"

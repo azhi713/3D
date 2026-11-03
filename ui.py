@@ -1461,6 +1461,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 win.clipboard_append(record.note)
                 win.update_idletasks()
             ttk.Button(actions, text='复制说明／失败原因', command=copy_note).pack(side='left')
+        if record.status in ('待确认','部分识别','AI待确认'):
+            def audit():
+                win.destroy()
+                self.edit_record(record.record_id)
+            ttk.Button(actions,text='人工核对／修改后确认',command=audit).pack(side='right',padx=(0,8))
         if record.status == 'AI待确认':
             def accept():
                 try:
@@ -1534,8 +1539,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
         lines.append('确认实收：'+receipt_message)
         self.set_text(text, '\n'.join(lines))
 
-    def edit_record(self):
-        record = self.selected_record()
+    def edit_record(self, record_id=None):
+        record = self.store.get(record_id) if record_id else self.selected_record()
         if not record:
             return
         win = tk.Toplevel(self)

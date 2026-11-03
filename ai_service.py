@@ -248,12 +248,21 @@ class AIService:
             except ValueError:
                 pass
         instructions=(self.config.get('prompt') or DEFAULT_AI_PROMPT).strip()
-        instructions += '\n' + 'V2.5.7双字段协议：candidate_bets每笔返回segment_id、bet_type、ticket_codes或digit_set或position_sets、declared_amount_yuan和bet_multiples两个独立字段；没有明示倍数写null。元米块是金额，倍是倍数。无单位数字只有合计能唯一核对时可解释为金额。四码及以上组选包码输出四码组六/四码组三等，除非原文明示复式。不计算投注本金或倍数；不要重复local_confirmed。只输出JSON对象。'
+        instructions += ('\nV2.6.6独立识别协议：完整阅读输入JSON中的raw_text，'
+                         '以下新协议覆盖上述旧版只解释unresolved_segments的要求；local_confirmed仅供参考，不能限制AI理解；'
+                         '按真实source_segments分组返回全部可证实的candidate_bets；'
+                         '每笔含segment_id、bet_type、ticket_codes/digit_set/position_sets、'
+                         'bet_multiples、declared_amount_yuan、amount_kind、multiple_type；'
+                         '明确倍数保留原值，明确金额保留金额，未知写null；'
+                         '金额字段是该candidate_bets项全部号码的总金额，而不是每注金额；'
+                         '同一号码重复购买必须逐次表达；不准编造号码、玩法、金额、倍数；'
+                         '无法确定的子项列入uncertainties，仍返回可确定的候选。')
         # V257-RECEIPT-FOLLOWUP-20261101: deterministic receipt-backed candidates first.
         # Still validated by the normal period-specific candidate pipeline.
         from receipt_inference_v257 import infer_receipt_candidates
-        inferred = infer_receipt_candidates(request_data)
-        if inferred is not None:
+        inferred = (None if request_data.get('use_full_ai_interpretation')
+                    else infer_receipt_candidates(request_data))
+        if inferred is not None and not request_data.get('use_full_ai_interpretation'):
             self._timing_local.metrics = {
                 'api_total_s': 0.0, 'response_s': 0.0, 'json_s': 0.0,
                 'transport_stage': 'local_receipt', 'billing_state': 'not_sent',

@@ -266,7 +266,7 @@ class Controller:
         from evidence_v257 import source_segments
         segments=source_segments(record.raw_text)
         scoped=[]
-        for p in ai_fragments(record):
+        for p in record.pending_fragments:
             lo,hi=p.get('start'),p.get('end')
             intersecting=[s['segment_id'] for s in segments
                           if isinstance(lo,int) and isinstance(hi,int) and
@@ -280,8 +280,11 @@ class Controller:
                            'local_confirmed':confirmed,
                            'local_confirmed_count':len(record.bets),
                            'local_confirmed_amount_yuan':sum(cents(b.principal) for b in record.bets)/100,
-                           'instruction':'只解释未确定投注；使用程序提供的segment_id。'
-                                         '不用计算字符偏移；勿重复已确认投注；金额/倍数必须区分。'},
+                           'use_full_ai_interpretation':True,
+                           'original_message':record.source_original_text or record.raw_text,
+                           'instruction':'独立理解完整raw_text，local_confirmed仅作参考、不可作为语法限制；'
+                                         '必须解释全部有依据的投注并保留重复购买；使用真实segment_id，'
+                                         '不计算字符偏移，不得虚构号码/玩法/倍数，金额与倍数分开。'},
                           ensure_ascii=False)
 
     def ai_text_for_record(self, record, allow_existing_candidate=False):
@@ -295,9 +298,15 @@ class Controller:
             return ''  # 已有AI候选待审，禁止重启后反复发送并重复扣费。
         if record.ai_request_state in ('started','unknown_billing') and not allow_existing_candidate:
             return ''
-        if any(not frag.get('ai_eligible', False) for frag in record.pending_fragments):
-            return ''  # 同一消息含违规上下文时，整体人工核对，防止AI错配片段。
-        return '\n'.join(item['text'] for item in ai_fragments(record))
+        from recognition_policy import classify_fragment
+        policy=classify_fragment(record.raw_text)
+        if policy['code'] in ('manual_instruction','rule_violation','unconfirmed_rule','non_bet'):
+            return ''  # 撤单、明确无效玩法等不允许AI擅自改为有效投注。
+        if record.status=='规则违规':
+            return ''
+        if not record.pending_fragments and record.parse_status!='amount_mismatch':
+            return ''
+        return record.raw_text  # 本地错误/金额歧义不再阻止AI理解整条消息。
 
     @staticmethod
     def _annotate_bets(record, parser):
@@ -368,58 +377,34 @@ class Controller:
         used_ai = False
         review_note = ''
         if record.ai_candidate and (pending or not bets):
-            eligible = [p for p in pending if p.get('ai_eligible')]
-            forbidden = any(not frag['ai_eligible'] for frag in pending)
             from deadline_v260 import allow_candidate
-            if forbidden or not eligible or not allow_candidate(self, record):
-                review_note = '；明确违规、冲突或已截止，AI候选不得改变原下注'
+            from recognition_policy import classify_fragment
+            policy=classify_fragment(record.raw_text)
+            if (not allow_candidate(self,record) or
+                policy['code'] in ('manual_instruction','rule_violation','unconfirmed_rule','non_bet')):
+                review_note='；存在撤单、明确违规或已截止等禁止自动入账的情况'
             else:
-                probe = BetParser(parser.rules, parser.policy)
-                from ai_candidates import decode_candidate
-                ai_bets, candidate_normalized, ai_error = decode_candidate(record.ai_candidate,probe,record.lottery,text)
-                combined, additional = self._merge_ai_bets(bets, ai_bets)
-                # 不再拿“孤立的4/定位”与模型输出直接逐号比；必须对整条原文核验。
-                matches, validation_reason = ai_candidate_validation(
-                    text, record.ai_candidate, combined, parser, record.lottery)
-                # Structured candidates may resolve only some independent pending spans.
-                # Each accepted span must be completely accounted for; untouched spans remain visible.
-                partial_accepted=False
-                if not matches and additional and all(b.parse_source=='ai_evidence_verified' for b in additional):
-                    from bet_evidence import independent_source_bets,ledger
-                    covered=[]
-                    for frag in pending:
-                        fragments=[b for b in additional if b.source_span.get('text')==frag['text']]
-                        expected,complete=independent_source_bets(parser,record.lottery,frag['text'])
-                        if fragments and complete and ledger(expected)==ledger(fragments):covered.append(frag)
-                    if covered and all(any(b.source_span.get('text')==f['text'] for f in covered) for b in additional):
-                        bets=combined
-                        pending=[f for f in pending if f not in covered]
-                        used_ai=True
-                        partial_accepted=True
-                        review_note='；AI已验证部分已入账，剩余疑难仍待核对' if pending else ''
-                if partial_accepted:
-                    pass
-                elif not matches:
-                    review_note = '；AI复核未通过：' + (validation_reason if ai_bets else ('AI转换未通过本地校验：' + ai_error))
-                elif not additional and pending and not self._is_verified_total_note(text, pending, bets):
-                    # AI只重复了已确定的订单，却没有处理剩余文字，不可假装已完成。
-                    review_note = '；AI只返回已识别投注，未解释疑难片段，未重复入账'
-                elif ai_bets:
-                    for bet in additional:
-                        bet.parse_source = 'ai_assisted'
-                    bets = combined
-                    if record.ai_candidate.lstrip().startswith('{'):
-                        from evidence_v257 import fragment_resolved
-                        pending = [p for p in pending if not fragment_resolved(text, p, additional, bets)]
-                        if pending:
-                            review_note = '；AI已核对部分投注，仍有真正未解释的原文'
-                    else:
-                        pending = []
-                    normalized = candidate_normalized
-                    reason = ''
-                    used_ai = True
+                from ai_pipeline_v266 import reconcile
+                from ai_pipeline_v266 import message_total
+                result=reconcile(record.raw_text,record.ai_candidate,parser,record.lottery,
+                                 bets,pending,claimed)
+                if result.accepted or result.complete:
+                    bets=result.bets
+                    pending=self._pending_with_policy(result.pending,text)
+                    used_ai=True
+                    if result.complete:
+                        # Full AI evidence independently verified. Prior local
+                        # provisional line receipts must not override it.
+                        provisional_due=None
+                        receipt_rows=[]
+                        grand=message_total(record.raw_text)
+                        if grand is not None:claimed=float(grand)
+                        reason='AI独立证据及原文覆盖校验通过'
+                    review_note=('；AI独立证据校验成功，剩余疑问保留' if pending
+                                 else '；AI独立证据校验通过')
+                    if result.detail:review_note+='；'+result.detail
                 else:
-                    review_note = '；AI转换未通过本地校验：' + ai_error
+                    review_note='；AI候选未通过独立证据校验：'+(result.detail or '原文证据不足')
         # Re-audit after verified AI candidates have replaced tentative local bets.
         # A bare trailing count is not a claimed cash receipt.
         final_audit = audit_untyped_tail(text, bets, claimed, receipt_rows)
@@ -458,7 +443,8 @@ class Controller:
             if money_warnings:
                 record.note += '；' + '；'.join(money_warnings)
         if used_ai:
-            record.note += '；AI转换已通过程序校验，自动计入' if not allow_conflict else '；AI候选经人工确认并通过本地校验'
+            if pending:record.note += '；仅将已验证的AI投注保留，剩余片段待核对'
+            else:record.note += '；AI独立证据校验通过'
         if record.claimed_amount is not None and bets and not pending:
             if cents(record.claimed_amount) != due:
                 record.note += f'；自报{record.claimed_amount:g}元，差额{(due-cents(record.claimed_amount))/100:g}元'
@@ -603,6 +589,7 @@ class Controller:
         if not source_text:
             # 最关键的安全边界：无AI许可的违规订单不能靠模型改写后自动入账。
             return False
+        previous_bet_count=len(record.bets)
         record.ai_candidate = candidate
         record.ai_request_state = 'responded'
         record.ai_history.append({'at':now().isoformat(), 'source_fragments':source_text,
@@ -620,7 +607,8 @@ class Controller:
         except StaleRecordError:
             return False
         self.last_ai_metrics['posting_s']=perf_counter()-posting
-        return record.status == '已识别'
+        return (record.status == '已识别' or
+                (record.status == '部分识别' and len(record.bets)>previous_bet_count))
 
     def accept_ai(self, record):
         if not record.ai_candidate:
