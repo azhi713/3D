@@ -26,6 +26,9 @@ from parser import BetParser
 from wechat_service import WeChatService
 from risk_engine import (plan_text, adjust_plan_rows,
                          plan_financials, calculate_total_profit_cents)
+from ui_state_v273 import UIStateV273, visible_periods
+from risk_extension_v2734 import (threshold_number_copy,
+    freeze_purchase_snapshot, actual_purchase_financials)
 from data_contract import record_to_contract
 from draw_service import fetch_draw, DrawLookupError
 from ui_diff import sync_tree
@@ -397,12 +400,14 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def __init__(self, base_dir):
         super().__init__()
         self.base_dir = Path(base_dir)
+        self._ui_state = UIStateV273(self.base_dir / 'data' / 'ui_state_v273.json')
         self.title(APP_NAME+' · '+APP_VERSION)
         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
         # 小屏幕优先给正文留出空间，不允许默认高度超出物理屏幕。
         width = min(1440, max(960, screen_w-80))
         height = min(980, max(630, screen_h-85))
-        self.geometry(f'{width}x{height}')
+        remembered = self._ui_state.get_window_geometry(screen_w, screen_h)
+        self.geometry(remembered or f'{width}x{height}')
         self.minsize(min(1040, max(900, screen_w-80)), min(700, max(590, screen_h-85)))
         self.configure(bg=BG)
         self.store = DataStore(base_dir)
@@ -421,6 +426,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.metric = tk.StringVar(value='总赔付' if self.controller.settings['threshold_metric'] == 'payout' else '净亏损')
         self.receipt = tk.StringVar()
         self.draw_number = tk.StringVar()
+        self.hedge_confirmed = tk.BooleanVar(value=False)
         self._draw_context = None
         self._draw_online = None
         self._draw_preview = None
@@ -467,7 +473,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 self.store.update(old,'恢复中断的本地识别')
         self._style()
         self._build()
+        if self._ui_state.data.get('window_zoomed'):
+            self.after(80, lambda: self.state('zoomed'))
         self._install_shortcuts()
+        self.bind_all('<KeyPress>', self._on_risk_adjust_hotkey, add='+')
         self.refresh()
         self.protocol('WM_DELETE_WINDOW', self.close)
         self._timer = self.after(200, self.pump)
@@ -510,7 +519,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         style.map('Treeview', background=[('selected', '#dce8ff')], foreground=[('selected', INK)])
         style.configure('Risk.Treeview', rowheight=32, background='white', fieldbackground='white',
                         borderwidth=0, font=('Microsoft YaHei UI', 10))
-        style.map('Risk.Treeview', background=[('selected', '#dce8ff')], foreground=[('selected', INK)])
+        style.map('Risk.Treeview', background=[('selected', '#dce8ff')], foreground=[])
         style.configure('On.TButton', background='#e8f7ee', foreground='#167647')
         style.configure('Off.TButton', background='#fff0f1', foreground=RED)
         style.configure('Warn.TButton', background='#fff5e8', foreground=ORANGE)
@@ -558,6 +567,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.period_combo.pack(side='left')
         self.period_combo.bind('<<ComboboxSelected>>', self.switch_period)
         self.period_combo.bind('<Return>', self.switch_period)
+        ttk.Button(scope, text='日期管理', command=self.manage_periods).pack(side='left', padx=(7, 0))
 
         exports = ttk.Frame(context)
         exports.pack(side='right', padx=(12, 0))
@@ -602,9 +612,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
             row, col = divmod(i, 4)
             metrics.columnconfigure(col, weight=1, uniform='metric')
             card_bg = '#eaf7ef' if key == 'total_profit' else 'white'
-            card = tk.Frame(metrics, bg=card_bg, bd=1, relief='solid', padx=12, pady=7)
-            card.grid(row=row, column=col, columnspan=2 if key == 'total_profit' else 1,
+            card = tk.Frame(metrics, bg=card_bg, bd=1, relief='solid', padx=12, pady=7, height=86)
+            card.grid(row=row, column=col,
                       sticky='ew', padx=(0, 8 if col < 3 else 0), pady=(0, 5))
+            card.pack_propagate(False)
             tk.Label(card, text=label, bg=card_bg, fg=MUTED).pack(anchor='w')
             value = tk.Label(card, text='—', bg=card_bg,
                              fg=RED if key in ('loss', 'payout') else INK,
@@ -628,36 +639,35 @@ class RiskApp(ShortcutMixin, tk.Tk):
                                anchor='e', justify='right', wraplength=670)
         self.status.grid(row=0, column=1, sticky='ew', padx=(0, pad), pady=6)
 
+        # V2732：八张顶栏卡片尺寸相同；开奖号码仅显示输入与联网获取。
+        draw_metric = tk.Frame(metrics, bg='white', bd=1, relief='solid', padx=12,
+                               pady=7, height=86)
+        draw_metric.grid(row=1, column=3, sticky='ew', padx=(0, 0), pady=(0, 5))
+        draw_metric.pack_propagate(False)
+        tk.Label(draw_metric, text='开奖号码', bg='white', fg=MUTED).pack(anchor='w')
+        draw_controls = ttk.Frame(draw_metric)
+        draw_controls.pack(anchor='w', pady=(2, 0))
+        self.draw_entry = ttk.Entry(draw_controls, textvariable=self.draw_number, width=5,
+                                    font=('Consolas', 16, 'bold'), justify='center')
+        self.draw_entry.pack(side='left')
+        self.draw_entry.bind('<KeyRelease>', self._draw_edited)
+        self.draw_fetch_button = ttk.Button(draw_controls, text='联网获取', command=self.lookup_draw)
+        self.draw_fetch_button.pack(side='left', padx=(7, 0))
+        self.draw_error_more = ttk.Button(draw_controls, text='详情',
+                                          command=self.show_draw_lookup_error)
+        self.draw_error_more.pack_forget()
+        # 保留原程序的configure调用对象；不在卡片里展示冗长状态文字。
+        self.draw_source_label = ttk.Label(draw_metric, text='', foreground=MUTED)
+        self.draw_summary_label = ttk.Label(draw_metric, text='', foreground=MUTED)
+
         self.workspace_tabs = ttk.Notebook(self)
         self.workspace_tabs.pack(fill='both', expand=True, padx=pad, pady=(0, 8))
         records_page = ttk.Frame(self.workspace_tabs)
         risks_page = ttk.Frame(self.workspace_tabs)
         self.workspace_tabs.add(records_page, text='  投注管理  ')
-        self.workspace_tabs.add(risks_page, text='  实时风险 / 开奖试算  ')
+        self.workspace_tabs.add(risks_page, text='  实时风险  ')
+        self.risks_page = risks_page
 
-        # V272：开奖号码输入并入实时风险页；三位输入自动试算，不提供正式结算入口。
-        draw_strip = ttk.LabelFrame(risks_page, text='开奖号码 · 自动试算', padding=(10, 7))
-        draw_strip.pack(fill='x', pady=(8, 6))
-        draw_line = ttk.Frame(draw_strip)
-        draw_line.pack(fill='x')
-        ttk.Label(draw_line, text='开奖号码').pack(side='left', padx=(0, 7))
-        self.draw_entry = ttk.Entry(draw_line, textvariable=self.draw_number, width=6,
-                                    font=('Consolas', 19, 'bold'), justify='center')
-        self.draw_entry.pack(side='left')
-        self.draw_entry.bind('<KeyRelease>', self._draw_edited)
-        self.draw_fetch_button = ttk.Button(draw_line, text='联网获取', command=self.lookup_draw)
-        self.draw_fetch_button.pack(side='left', padx=(9, 12))
-        self.draw_source_label = ttk.Label(draw_line, text='输入三位号码后自动试算',
-                                           foreground=MUTED)
-        self.draw_source_label.pack(side='left', fill='x', expand=True)
-        self.draw_error_more = ttk.Button(draw_line, text='查看联网详情',
-                                           command=self.show_draw_lookup_error)
-        self.draw_error_more.pack(side='right')
-        self.draw_error_more.pack_forget()
-        self.draw_summary_label = ttk.Label(
-            draw_strip, text='试算仅用于模拟，不写入投注记录或兑奖账本。',
-            foreground=MUTED, wraplength=1200, justify='left')
-        self.draw_summary_label.pack(fill='x', anchor='w', pady=(5, 0))
 
         # 第一页：录入区固定在上，记录表独占剩余全部空间。
         input_box = ttk.LabelFrame(records_page, text='手动补录', padding=(12, 9))
@@ -737,9 +747,21 @@ class RiskApp(ShortcutMixin, tk.Tk):
         risk_box.rowconfigure(1, weight=1)
         risk_box.columnconfigure(0, weight=1)
 
-        self.risk_info = ttk.Label(risk_box, text='点击号码查看命中明细。原始投注倍数与建议补单倍数分别展示。',
-                                   foreground=MUTED)
-        self.risk_info.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        risk_header = ttk.Frame(risk_box)
+        risk_header.grid(row=0, column=0, sticky='ew', pady=(0, 6))
+        self.risk_info = ttk.Label(risk_header,
+            text='点击号码查看命中明细。原始投注倍数与建议补单倍数分别展示。',
+            foreground=MUTED)
+        self.risk_info.pack(side='left', fill='x', expand=True)
+        self.risk_search = tk.StringVar(value='')
+        risk_search_entry = ttk.Entry(risk_header, textvariable=self.risk_search, width=13)
+        risk_search_entry.pack(side='right')
+        ttk.Label(risk_header, text='搜索号码').pack(side='right', padx=(3, 6))
+        self.risk_search.trace_add('write', lambda *_: self.locate_risk_number())
+        self.copy_risk_numbers_button = ttk.Button(
+            risk_header, text='复制号码', width=9,
+            command=self.copy_risk_numbers, state='disabled')
+        self.copy_risk_numbers_button.pack(side='right', padx=(0, 9))
         # 纵向拉动分隔线，可自行调整排行榜与明细的高度。
         self.risk_pane = tk.PanedWindow(risk_box, orient='vertical', bd=0, sashwidth=9,
                                        sashrelief='flat', showhandle=True, bg=GRID)
@@ -756,6 +778,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         risk_scroll.grid(row=0, column=1, sticky='ns')
         self.risks_tree.configure(yscrollcommand=risk_scroll.set)
         self.risks_tree.bind('<<TreeviewSelect>>', self.show_sources)
+        self.risks_tree.tag_configure('draw_hit', foreground=RED)
         for key, title in [('number', '开奖号码'), ('payout', '预计赔付(元)'),
                            ('loss', '净亏损(元)'), ('plan', '建议补单(倍)')]:
             self.risks_tree.heading(key, text=title, command=lambda k=key:self.sort_risks(k))
@@ -795,6 +818,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.risk_pane.add(source_bottom, minsize=165, stretch='always')
         self._risk_sash_initialized = False
         self.risk_pane.bind('<Configure>', self._position_initial_risk_details)
+        self.risk_pane.bind('<ButtonRelease-1>', self._save_risk_split, add='+')
 
         plan_box = ttk.LabelFrame(risk_panel, text='建议补单方案', padding=10)
         plan_box.grid(row=0, column=1, sticky='nsew')
@@ -811,6 +835,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.plan_plus_button = ttk.Button(plan_toolbar, text='+', width=3,
                                            command=lambda: self.adjust_plan(1))
         self.plan_plus_button.pack(side='right')
+        self.actual_hedge_checkbox = ttk.Checkbutton(
+            plan_toolbar, text='已补单', variable=self.hedge_confirmed,
+            command=self._toggle_actual_hedge)
+        self.actual_hedge_checkbox.pack(side='right', padx=(5, 12))
         self.plan = tk.Text(plan_box, height=10, wrap='word', bg='white',
                             relief='solid', bd=1, fg=INK,
                             font=('Microsoft YaHei UI', 11))
@@ -867,6 +895,161 @@ class RiskApp(ShortcutMixin, tk.Tk):
         except (ValueError, OSError, sqlite3.Error) as exc:
             self.warning.configure(text='阈值无效或设置未保存：'+str(exc))
 
+    def _managed_periods(self):
+        # 只读查询：已删除投注不再撑大日期列表，但已封盘/结算的日期仍可受保护显示。
+        rows = self.store.db.execute(
+            'SELECT DISTINCT period FROM records WHERE deleted=0 '
+            'UNION SELECT period FROM settlements '
+            'UNION SELECT period FROM batch_snapshots ORDER BY period DESC').fetchall()
+        return [str(row[0]) for row in rows]
+
+    def _visible_periods(self):
+        return visible_periods(
+            self._managed_periods(), now().date().isoformat(),
+            self.controller.period, self._ui_state.hidden_periods(),
+            self._ui_state.data.get('period_range', '7'))
+
+    def manage_periods(self):
+        manager = tk.Toplevel(self)
+        manager.title('历史日期管理')
+        manager.geometry('760x520')
+        manager.minsize(600, 430)
+        manager.transient(self)
+        manager.grab_set()
+        outer = ttk.Frame(manager, padding=12)
+        outer.pack(fill='both', expand=True)
+        line = ttk.Frame(outer)
+        line.pack(fill='x', pady=(0, 8))
+        ttk.Label(line, text='日期下拉显示范围：').pack(side='left')
+        labels = {'最近7天': '7', '最近30天': '30', '全部日期': 'all'}
+        reverse = {v:k for k,v in labels.items()}
+        choice = tk.StringVar(value=reverse.get(
+            self._ui_state.data.get('period_range', '7'), '最近7天'))
+        combo = ttk.Combobox(line, textvariable=choice, values=list(labels),
+                             width=12, state='readonly')
+        combo.pack(side='left')
+        ttk.Label(line, text='隐藏日期不删除任何投注，清理投注为软删除。',
+                  foreground=MUTED).pack(side='left', padx=(14, 0))
+        # V2731-DATE-DIALOG-LAYOUT-FIX
+        # 表格和滚动条属于同一个容器，禁止Treeview直接pack在outer里。
+        # 这样日期列表始终填满中间区域，不挤占底部操作按钮。
+        table_frame = ttk.Frame(outer)
+        table_frame.pack(fill='both', expand=True, pady=(0, 2))
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+        columns = ('period', 'fc', 'tc', 'state')
+        tree = ttk.Treeview(table_frame, columns=columns,
+                            show='headings', selectmode='extended', height=10)
+        for key, title, width in [('period', '日期', 170), ('fc', '福彩笔数', 125),
+                                  ('tc', '体彩笔数', 125), ('state', '状态', 260)]:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=80, stretch=True)
+        scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+
+        def reload_rows():
+            old = set(tree.selection())
+            tree.delete(*tree.get_children())
+            counts = {}
+            for period, lottery, count in self.store.db.execute(
+                    'SELECT period,lottery,COUNT(*) FROM records WHERE deleted=0 '
+                    'GROUP BY period,lottery'):
+                counts.setdefault(period, {})[lottery] = count
+            for period in self._managed_periods():
+                settlement = any(self.store.load_settlement(period, lottery)
+                                 for lottery in ('福彩', '体彩'))
+                cutoff = any(self.store.load_batch(period, lottery)
+                             for lottery in ('福彩', '体彩'))
+                statuses = []
+                if period in self._ui_state.hidden_periods(): statuses.append('已隐藏')
+                if settlement: statuses.append('已正式结算')
+                if cutoff: statuses.append('存在封盘快照')
+                if not statuses: statuses.append('正常')
+                detail = counts.get(period, {})
+                tree.insert('', 'end', iid=period,
+                            values=(period, detail.get('福彩',0),
+                                    detail.get('体彩',0), ' / '.join(statuses)))
+                if period in old: tree.selection_add(period)
+
+        def set_range(_event=None):
+            self._ui_state.set_period_range(labels[choice.get()])
+            self.refresh()
+
+        def set_hidden(hidden):
+            selected = list(tree.selection())
+            if not selected: return
+            for period in selected:
+                if period == now().date().isoformat() and hidden:
+                    continue
+                self._ui_state.set_hidden(period, hidden)
+            if self.controller.period in self._ui_state.hidden_periods():
+                today = now().date().isoformat()
+                self.controller.activate_period(today)
+                self.period.set(today)
+            self.refresh()
+            reload_rows()
+
+        def delete_period_bets():
+            selected = list(tree.selection())
+            if not selected: return
+            protected = [period for period in selected if any(
+                self.store.load_settlement(period, lottery) or
+                self.store.load_batch(period, lottery) for lottery in ('福彩', '体彩'))]
+            if protected:
+                messagebox.showwarning('不能清理已结算/封盘日期',
+                    '以下日期有正式结算或封盘快照，不能直接删除投注：\n' +
+                    '、'.join(protected), parent=manager)
+                return
+            ids = [row[0] for row in self.store.db.execute(
+                'SELECT id FROM records WHERE deleted=0 AND period IN (' +
+                ','.join('?' for _ in selected) + ')', selected)]
+            if not ids: return
+            if not messagebox.askyesno('确认删除历史投注',
+                    f'将软删除 {len(selected)} 个日期、共 {len(ids)} 条投注记录（包含福彩和体彩）。\n'
+                    '后续风险统计将立即变化；审计记录保留，不能在界面撤销。\n'
+                    '确定清理吗？', parent=manager):
+                return
+            self.store.delete_many(ids)
+            self.ai_busy.difference_update(ids)
+            self._manual_ai.difference_update(ids)
+            if self.controller.period in selected:
+                today = now().date().isoformat()
+                self.controller.activate_period(today)
+                self.period.set(today)
+            self.refresh()
+            reload_rows()
+
+        combo.bind('<<ComboboxSelected>>', set_range)
+        # 固定的底部操作栏：常用操作靠左，清理与关闭靠右。
+        ttk.Separator(outer, orient='horizontal').pack(fill='x', pady=(9, 9))
+        actions = ttk.Frame(outer)
+        actions.pack(fill='x', side='bottom')
+        left_actions = ttk.Frame(actions)
+        left_actions.pack(side='left')
+        right_actions = ttk.Frame(actions)
+        right_actions.pack(side='right')
+        hide_button = ttk.Button(left_actions, text='隐藏选中日期',
+                                 command=lambda: set_hidden(True))
+        hide_button.pack(side='left')
+        restore_button = ttk.Button(left_actions, text='恢复显示',
+                                    command=lambda: set_hidden(False))
+        restore_button.pack(side='left', padx=(8, 0))
+        ttk.Button(right_actions, text='关闭', command=manager.destroy).pack(side='right')
+        delete_button = ttk.Button(right_actions, text='删除选中日期投注',
+                                   command=delete_period_bets)
+        delete_button.pack(side='right', padx=(0, 8))
+
+        def update_action_buttons(_event=None):
+            enabled = 'normal' if tree.selection() else 'disabled'
+            for button in (hide_button, restore_button, delete_button):
+                button.configure(state=enabled)
+
+        tree.bind('<<TreeviewSelect>>', update_action_buttons, add='+')
+        reload_rows()
+        update_action_buttons()
+
     def switch_period(self, event=None):
         value = self.period.get().strip()
         if not value or len(value) > 40 or any(char in value for char in '/\\'):
@@ -911,7 +1094,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         in_queue=sum(r.ai_request_state=='queued' and r.status=='AI识别中' for r in records)
         active=sum(r.ai_request_state=='started' and r.status=='AI识别中' for r in records)
         self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 待处理{len(records)-recognized} · AI排队{in_queue} · 处理中{active} · 已选{len(self.records_tree.selection())}')
-        periods = list(dict.fromkeys([now().date().isoformat(), self.controller.period]+self.store.periods()))
+        periods = self._visible_periods()
         self.period_combo.configure(values=periods)
         inputs = self.controller.analysis_inputs(lottery,records)
         # Only financial inputs affect the 1000-outcome calculation; queue/status changes reuse it.
@@ -962,6 +1145,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 self.risk_source_title.configure(text='投注来源 · 请选择上方号码')
                 self.set_text(self.sources, '点选风险号码，再点下方投注行查看原始消息和赔付计算依据。')
             self.risk_info.configure(text=f'{len(self.snapshot.risks)}个号码达到当前筛选条件  ·  点击号码查看原始投注与赔付依据')
+            self.locate_risk_number()
             self._render_plan()
             if re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip()):
                 self.calculate_draw(silent=True)
@@ -997,6 +1181,71 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.update_status()
 
     # V272-UI-MERGED-SIMULATION
+    # V273-UI-PERSISTENT-RISK-PAGE
+    def _save_ui_scope(self):
+        self._ui_state.put_scope(self.lottery.get(), self.controller.period,
+                                 self.draw_number.get().strip(), self._plan_adjustment)
+
+    def _on_risk_adjust_hotkey(self, event):
+        if getattr(self, '_closing', False):
+            return None
+        try:
+            focus = self.focus_get()
+            if focus is None or focus.winfo_toplevel() is not self:
+                return None
+            if self.workspace_tabs.select() != str(self.risks_page):
+                return None
+            if isinstance(focus, (tk.Text, tk.Entry, ttk.Entry, ttk.Combobox, tk.Spinbox)):
+                return None
+            if not (int(event.state) & 0x4):  # Ctrl
+                return None
+            symbol = str(event.keysym).lower()
+            if symbol in ('plus', 'equal', 'kp_add'):
+                self.adjust_plan(1)
+                return 'break'
+            if symbol in ('minus', 'underscore', 'kp_subtract'):
+                self.adjust_plan(-1)
+                return 'break'
+        except (tk.TclError, ValueError):
+            return None
+        return None
+
+    def _toggle_actual_hedge(self):
+        """只在手动勾选当时冻结已买方案；加减模拟倍数不修改已买记录。"""
+        scope = (self.lottery.get(), self.controller.period)
+        if self.hedge_confirmed.get():
+            if not self.snapshot:
+                self.hedge_confirmed.set(False)
+                messagebox.showwarning('不能确认补单', '请先等待实时风险计算完成。', parent=self)
+                return
+            settings = self.controller.settings
+            lottery = self.lottery.get()
+            try:
+                purchase = freeze_purchase_snapshot(
+                    self._adjusted_plan_rows(),
+                    settings['direct_unit_cost'][lottery],
+                    settings['external_direct_prize'][lottery],
+                    settings['external_leopard_direct_prize'][lottery])
+                if purchase is None:
+                    self.hedge_confirmed.set(False)
+                    messagebox.showwarning('不能确认补单', '当前没有正倍数补单号码。', parent=self)
+                    return
+                self._ui_state.put_actual_hedge(*scope, purchase)
+            except (TypeError, ValueError, KeyError) as exc:
+                self.hedge_confirmed.set(False)
+                messagebox.showwarning('补单保存失败', str(exc), parent=self)
+                return
+        else:
+            existing = self._ui_state.get_actual_hedge(*scope)
+            if existing and not messagebox.askyesno(
+                    '取消已补单', '确认清除此日期的已补单记录？\n'
+                    '清除后今日总盈亏将不再计入这笔补单的成本和中奖收入。', parent=self):
+                self.hedge_confirmed.set(True)
+                return
+            self._ui_state.put_actual_hedge(*scope, None)
+        self._render_plan()
+        self._update_financial_cards()
+
     def _adjusted_plan_rows(self):
         if not self.snapshot:
             return []
@@ -1014,8 +1263,13 @@ class RiskApp(ShortcutMixin, tk.Tk):
             text = ('[仅供人工核对 / 不可作为正式补单依据]\n'
                     '当前统计不完整，存在未确认投注；不得直接按此方案下注。\n\n' + text)
         self.set_text(self.plan, text)
-        note = ('已计入全部补单成本' if self.controller.settings['include_hedge_cost']
-                else '倍数计算忽略补单成本')
+        purchased = self._ui_state.get_actual_hedge(
+            self.lottery.get(), self.controller.period)
+        if purchased:
+            note = (f'已补单 · {sum(x[1] for x in purchased["rows"])}注 · '
+                    f'成本{yuan_fmt(purchased["cost_cents"] / 100)}元')
+        else:
+            note = '未实际补单 · 建议方案仅模拟'
         self.plan_note.configure(text=note)
         self.plan_adjust_label.configure(
             text=f'全局调整：{self._plan_adjustment:+d}倍 · 新增号码沿用当前倍数')
@@ -1037,6 +1291,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         if int(delta) < 0 and not any(row.plan_multiplier > 1 for row in self._plan_rows):
             return
         self._plan_adjustment += 1 if int(delta) > 0 else -1
+        self._save_ui_scope()
         self._render_plan()
         self._render_risk_rows()
         self._update_financial_cards()
@@ -1078,7 +1333,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 default=0
             )
             self.cards['income'].configure(text=money(self.snapshot.revenue) + '元', fg=INK)
-            self.cards['risk'].configure(text=str(len(self.snapshot.risks)), fg=INK)
+            self.cards['risk'].configure(text=str(len(self.snapshot.risks)) + '组', fg=INK)
             self.cards['loss'].configure(text=money(max(0, maximum)) + '元', fg=RED)
         else:
             for key in ('income', 'risk', 'loss'):
@@ -1109,13 +1364,16 @@ class RiskApp(ShortcutMixin, tk.Tk):
         today_income = (self.snapshot.revenue if self.snapshot
                         else cents(preview['income_yuan']))
         actual_payout = cents(preview['payout_yuan'])
+        actual_purchase = self._ui_state.get_actual_hedge(
+            self.lottery.get(), self.controller.period)
+        actual_result = actual_purchase_financials(actual_purchase, preview['draw'])
         total_profit = calculate_total_profit_cents(
-            today_income, actual_payout, result)
+            today_income, actual_payout, actual_result)
         uncertain = bool(preview.get('warnings')) or bool(self.snapshot and self.snapshot.pending)
         simulated = not re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip())
         suffix = ('（模拟）' if simulated else '') + (' *' if uncertain else '')
         scheme_profit = result['profit_cents']
-        scheme_income = result['income_cents']
+        scheme_income = actual_result['income_cents']
         self.cards['payout'].configure(
             text=yuan_fmt(actual_payout / 100) + '元' + suffix, fg=RED)
         self.cards['scheme_income'].configure(
@@ -1140,12 +1398,16 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.draw_error_more.pack_forget()
         self._draw_online = None
         self._draw_preview = None
-        self._plan_adjustment = 0
+        remembered = self._ui_state.get_scope(*context)
+        self.hedge_confirmed.set(
+            self._ui_state.get_actual_hedge(*context) is not None)
+        self._plan_adjustment = remembered['adjustment']
         self._plan_rows = []
         self.snapshot = None
         self._risk_key = None
         self._risk_detail_number = None
-        self.draw_number.set('')
+        self.draw_number.set(remembered['draw'])
+        self.copy_risk_numbers_button.configure(state='disabled', text='复制号码')
         self.risks_tree.delete(*self.risks_tree.get_children())
         self.source_rows.delete(*self.source_rows.get_children())
         self.risk_source_title.configure(text='投注来源 · 请选择上方号码')
@@ -1153,7 +1415,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._render_plan()
         self._update_financial_cards()
         self.draw_summary_label.configure(
-            text='输入三位开奖号码后自动试算；试算不会写入兑奖账本。',
+            text='三位自动试算 · 不入账',
             foreground=MUTED)
         saved = self.store.load_settlement(context[1], context[0])
         if saved:
@@ -1169,13 +1431,17 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._draw_online = None
         self._draw_preview = None
         number = self.draw_number.get().strip()
+        if number == '' or re.fullmatch(r'[0-9]{3}', number):
+            self._save_ui_scope()
+        if self.snapshot is not None:
+            self._render_risk_rows()
         self.draw_source_label.configure(text='当前号码来源：手动输入')
         if re.fullmatch(r'[0-9]{3}', number):
             self.draw_summary_label.configure(text='已输入三位号码，正在自动试算…',
                                               foreground=MUTED)
             self.after_idle(lambda: self.calculate_draw(silent=True))
         else:
-            self.draw_summary_label.configure(text='输入满三位数字后自动试算；试算不会写入兑奖账本。',
+            self.draw_summary_label.configure(text='输入3位自动试算',
                                               foreground=MUTED)
             self._simulate_risk_draw()
 
@@ -1222,11 +1488,14 @@ class RiskApp(ShortcutMixin, tk.Tk):
             else:
                 short = ('联网失败：' + error[:34]) if len(error) < 42 else '多来源查询未获得可核验的开奖号码'
             self.draw_source_label.configure(text=short, foreground=RED)
-            self.draw_error_more.pack(anchor='w', pady=(4, 0))
+            self.draw_error_more.pack(side='right', padx=(6, 0))
             return
         self._draw_lookup_error_detail = ''
         self.draw_error_more.pack_forget()
         self.draw_number.set(result.number)
+        self._save_ui_scope()
+        if self.snapshot is not None:
+            self._render_risk_rows()
         self._draw_preview = None
         self._draw_online = result
         self.draw_source_label.configure(text=f'官网核对：{result.draw_date} · 第{result.issue}期 · {result.source_name}', foreground=MUTED)
@@ -2085,22 +2354,81 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self.warning.configure(text='数据处理失败，原始消息仍保留：'+str(exc), fg=RED)
         self._timer = self.after(200, self.pump)
 
+    # V2733-RISK-SASH-PERSISTENCE
+    def _risk_split_target(self, height):
+        """相同高度精确恢复像素；高度变更则按上次拖动比例缩放。"""
+        saved = self._ui_state.data.get('risk_split')
+        if isinstance(saved, dict):
+            try:
+                old_height = int(saved['pane_height'])
+                old_y = int(saved['sash_y'])
+                ratio = float(saved['ratio'])
+                if (old_height >= 310 and 135 <= old_y <= old_height - 165
+                        and 0 < ratio < 1):
+                    requested = (old_y if old_height == height
+                                 else round(height * ratio))
+                    return max(135, min(height - 165, requested))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        # 未曾手动调整时维持原来默认布局。
+        bottom_height = min(215, max(165, int(height * 0.48)))
+        return height - bottom_height
+
     def _position_initial_risk_details(self, event=None):
-        """首次显示风险页时，给投注来源足够的高度；之后用户可自行拖动分隔线。"""
+        """首次显示及窗口缩放时，在Tk完成原生布局后恢复分隔线。"""
         try:
-            if self._risk_sash_initialized:
+            height = event.height if event is not None else self.risk_pane.winfo_height()
+            if height < 310:
                 return
-            height = event.height if event else self.risk_pane.winfo_height()
-            if height >= 310:
-                self._risk_sash_initialized = True
-                bottom_height = min(215, max(165, int(height * 0.48)))
-                self.risk_pane.sash_place(0, 1, height - bottom_height)
-        except tk.TclError:
+            if (self._risk_sash_initialized
+                    and getattr(self, '_risk_pane_previous_height', None) == height):
+                return
+            self._risk_pane_previous_height = height
+            # Tk PanedWindow 的 stretch=always 会在 Configure 之后再移动 sash。
+            # after_idle 等原生布局结束后设置，避免被 Tk 自动伸缩覆盖。
+            timer = getattr(self, '_risk_split_restore_timer', None)
+            if timer is not None:
+                self.after_cancel(timer)
+            self._risk_split_restore_timer = self.after_idle(self._apply_saved_risk_split)
+        except (tk.TclError, IndexError):
+            pass
+
+    def _apply_saved_risk_split(self):
+        self._risk_split_restore_timer = None
+        try:
+            height = self.risk_pane.winfo_height()
+            if height < 310:
+                return
+            self.risk_pane.sash_place(0, 1, self._risk_split_target(height))
+            self._risk_pane_previous_height = height
+            self._risk_sash_initialized = True
+        except (tk.TclError, IndexError):
+            pass
+
+    def _save_risk_split(self, event=None):
+        """仅在用户拖动结束或关闭时保存；不覆盖未初始化的旧配置。"""
+        if getattr(self, '_closing', False) or not self._risk_sash_initialized:
+            return
+        try:
+            height = self.risk_pane.winfo_height()
+            sash_y = int(self.risk_pane.sash_coord(0)[1])
+            # 若窗口未显示或小于原生两块的最小高度，则保留上一次有效位置。
+            if height < 310 or sash_y < 135 or height - sash_y < 165:
+                return
+            self._ui_state.data['risk_split'] = {
+                'pane_height': height,
+                'sash_y': sash_y,
+                'ratio': round(sash_y / height, 8),
+            }
+            self._ui_state.save()
+        except (tk.TclError, IndexError, AttributeError, ValueError):
             pass
 
     def _render_risk_rows(self):
         if not self.snapshot:
             return
+        self.copy_risk_numbers_button.configure(
+            state='normal' if self.snapshot.risks else 'disabled')
         rows = adjust_plan_rows(self.snapshot.risks, self._plan_adjustment)
         key = self._risk_sort_key
         keyfunc = {
@@ -2110,8 +2438,53 @@ class RiskApp(ShortcutMixin, tk.Tk):
             'plan': lambda r: r.plan_multiplier,
         }[key]
         rows.sort(key=lambda r: (keyfunc(r), r.number), reverse=self._risk_sort_reverse)
-        sync_tree(self.risks_tree,[(r.number,(r.number,yuan_fmt(r.payout),yuan_fmt(r.net_loss),str(r.plan_multiplier)),
-                                  ('odd',) if i % 2 else ()) for i,r in enumerate(rows)])
+        current_draw = self.draw_number.get().strip()
+        display_rows = []
+        for i, row in enumerate(rows):
+            hit = bool(re.fullmatch(r'[0-9]{3}', current_draw) and current_draw == row.number)
+            tags = ('draw_hit',) if hit else (('odd',) if i % 2 else ())
+            display_rows.append((row.number, (row.number, yuan_fmt(row.payout),
+                                 yuan_fmt(row.net_loss), str(row.plan_multiplier)), tags))
+        sync_tree(self.risks_tree, display_rows)
+
+    # V2734-COPY-AND-REAL-HEDGE
+    def copy_risk_numbers(self):
+        """从当前阈值分析结果复制全部号码，忽略搜索和当前排序。"""
+        if not self.snapshot:
+            return
+        text, number_count = threshold_number_copy(self.snapshot.risks, per_line=9)
+        if not text or number_count <= 0:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update_idletasks()
+            self.copy_risk_numbers_button.configure(text='已复制')
+            # 恢复按钮文案，不改变复制内容。
+            timer = getattr(self, '_risk_number_copy_timer', None)
+            if timer is not None:
+                self.after_cancel(timer)
+            self._risk_number_copy_timer = self.after(1800, self._reset_risk_copy_label)
+        except tk.TclError as exc:
+            messagebox.showerror('复制失败', str(exc), parent=self)
+
+    def _reset_risk_copy_label(self):
+        self._risk_number_copy_timer = None
+        try:
+            self.copy_risk_numbers_button.configure(text='复制号码')
+        except tk.TclError:
+            pass
+
+    def locate_risk_number(self):
+        number = self.risk_search.get().strip()
+        if not re.fullmatch(r'[0-9]{3}', number):
+            return
+        if not self.risks_tree.exists(number):
+            return
+        self.risks_tree.see(number)
+        self.risks_tree.selection_set(number)
+        self.risks_tree.focus(number)
+        self.show_sources()
 
     def sort_risks(self, key):
         if key not in ('number', 'payout', 'loss', 'plan'):
@@ -2951,6 +3324,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def close(self):
         if self._closing:
             return
+        self._save_risk_split()
+        self._ui_state.put_window_geometry(self.geometry())
+        self._ui_state.data['window_zoomed'] = self.state() == 'zoomed'
+        self._ui_state.save()
+        self._save_ui_scope()
         self._closing = True
         if self._timer:
             self.after_cancel(self._timer)
@@ -2991,3 +3369,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
 # V265-20261102-AUTO-RECOGNIZE-SAFE-RETRY
 
 # V267-UI-20261103
+
+# V2732-EQUAL-METRIC-DRAW-CARDS
+
+# V2734-COPY-AND-REAL-HEDGE

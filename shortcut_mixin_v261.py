@@ -47,7 +47,7 @@ class ShortcutMixin:
             if action in ('lottery_fc','lottery_tc'):
                 self.lottery.set('福彩' if action=='lottery_fc' else '体彩');self.refresh()
             elif action in ('tab_records','tab_risk','tab_draw'):
-                self.workspace_tabs.select({'tab_records':0,'tab_risk':1,'tab_draw':2}[action])
+                self.workspace_tabs.select({'tab_records':0,'tab_risk':1,'tab_draw':1}[action])
             elif action=='toggle_wechat':self.toggle_wechat()
             elif action=='toggle_ai':self.toggle_ai()
             elif action=='search_records':

@@ -25,7 +25,7 @@ SHORTCUT_GROUPS={
 }
 SHORTCUT_LABELS={
  'lottery_fc':'切换福彩3D','lottery_tc':'切换体彩排列三',
- 'tab_records':'投注管理','tab_risk':'实时风险','tab_draw':'开奖结算',
+ 'tab_records':'投注管理','tab_risk':'实时风险','tab_draw':'开奖试算（实时风险）',
  'toggle_wechat':'开启/关闭微信监听','toggle_ai':'开启/关闭AI识别',
  'search_records':'搜索投注记录','add_bet':'添加投注',
  'select_all':'全选记录','invert':'反选记录','clear_selection':'取消选择',
