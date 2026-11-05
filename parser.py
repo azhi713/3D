@@ -158,6 +158,11 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        # V275-LOCAL-DIRECT-BLOCKS: 本地优先确认完整多行直选订单，失败不回退猜单。
+        from local_direct_blocks_v275 import parse_local_blocks
+        recognized = parse_local_blocks(self, lottery, text)
+        if recognized is not None:
+            return recognized
         # V271: whole-message count reconciliation and amount-first shorthand.
         from context_receipts_v271 import parse_context_order
         contextual = parse_context_order(self, lottery, text)
@@ -463,6 +468,13 @@ class BetParser:
         buffer = []
         saw_summary = False
         for line in lines:
+            # V274-LONG-BOTTOM-LONG-AI：独立彩种标题不属于号码块。
+            # 仅允许出现在第一组号码之前；不得忽略其他未知说明。
+            token = line.strip()
+            if not saw_summary and not buffer and re.fullmatch(LOTTERY_TOKEN, token, re.I):
+                if lottery_from_token(token) != lottery:
+                    raise ValueError('大底开头彩种标题与当前彩种不一致')
+                continue
             match = summary_re.fullmatch(line.strip())
             if not match:
                 if line.strip():

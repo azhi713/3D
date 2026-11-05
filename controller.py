@@ -284,6 +284,14 @@ class Controller:
                            'reason':p.get('reason','')[:150]})
         confirmed=[{'play':b.play,'selection':b.selection,'multiplier':b.multiplier,
                     'source_span':b.source_span} for b in record.bets[:30]]
+        # V274-LONG-BOTTOM-LONG-AI：raw_text是唯一原文，长订单只发送段落坐标，避免复制完整文本三四遍。
+        if len(record.raw_text) > 1500:
+            segments = [{"segment_id": s["segment_id"], "start": s["start"],
+                         "end": s["end"]} for s in segments]
+            scoped = [{"segment_ids": s["segment_ids"],
+                       "reason": s["reason"]} for s in scoped]
+            if parent_text == record.raw_text:
+                parent_text = ''  # 同样的原文已完整保存在raw_text
         return json.dumps({'lottery':record.lottery,'raw_text':record.raw_text,
                            'source_segments':segments,'unresolved_segments':scoped,
                            'local_confirmed':confirmed,
@@ -295,7 +303,8 @@ class Controller:
                            'use_full_ai_interpretation':True,
                            'original_message':parent_text,
                            'instruction':'先完整阅读original_message理解上下文，再根据raw_text和当前彩种输出全部投注；'
-                                         'original_message仅供跨行/跨彩种语义参照，正式原文source_segments的范围只对应raw_text；'
+                                         'original_message为空时以raw_text作为完整原文；非空时仅供跨行/跨彩种语义参照；'
+                                          '正式原文source_segments的范围只对应raw_text；'
                                          'local_confirmed仅供参考，不能限制AI解释，也不意味着再增加投注；'
                                          '完整提取当前彩种的所有投注，允许结合原始消息共享明确玩法和金额；'
                                          '金额仅用于在没有明确倍数时推算；明确倍数与客户尾数冲突时保留明确倍数，'

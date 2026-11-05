@@ -16,7 +16,7 @@ from ai_transport_v262 import open_transport_request, TransportSetupError
 
 SYSTEM = DEFAULT_AI_PROMPT
 _TIMEOUT_OPTIONS = (15, 30, 60, 90, 120)
-_MAX_REPLY = 1024 * 1024
+_MAX_REPLY = 16 * 1024 * 1024
 _MAX_ERROR = 4096
 _LOG_LOCK = threading.Lock()
 
@@ -237,8 +237,8 @@ class AIService:
         return True, '连接正常'
 
     def parse_unknown(self, lottery, text):
-        if len(text) > 10000:
-            raise AIError('文字过长，请分批添加')
+        # V274-LONG-BOTTOM-LONG-AI：本地不限制AI输入字符数；由真实模型/中转站决定上下文上限。
+        # JSON参数不使用Infinity（非合法标准数字）；原请求也未设置max_tokens。
         request_data={'lottery':lottery,'raw_text':text}
         if text.lstrip().startswith('{'):
             try:
