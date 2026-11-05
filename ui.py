@@ -27,6 +27,9 @@ from wechat_service import WeChatService
 from risk_engine import (plan_text, adjust_plan_rows,
                          plan_financials, calculate_total_profit_cents)
 from ui_state_v273 import UIStateV273, visible_periods
+from hedge_edit_v276 import parse_hedge_text, update_display_total
+from hedge_optimizer_v277 import optimize_three_profiles
+from models import RiskRow
 from risk_extension_v2734 import (threshold_number_copy,
     freeze_purchase_snapshot, actual_purchase_financials)
 from data_contract import record_to_contract
@@ -434,9 +437,21 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._draw_lookup_request = 0
         self._plan_adjustment = 0  # 全局补单倍数偏移；同一期新生成号码继续沿用
         self._plan_rows = []
+        self._plan_manual_mode = False
+        self._plan_manual_text = None
+        self._plan_edit_error = ""
+        self._plan_edit_timer = None
+        self._plan_editor_block = False
+        self._last_plan_signature = None
+        self._plan_mode = 'manual'
+        self.plan_mode_choice = tk.StringVar(value='人工方案')
+        self._auto_optimizer_results = {}
+        self._auto_optimizer_error = ''
+        self._auto_optimizer_generation = 0
         self.events = queue.Queue()
         self.pool = PriorityExecutor(max_workers=max(1,min(32,int(self.controller.settings['ai'].get('max_concurrency',16)))), thread_name_prefix='bet-ai')
         self.risk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='risk-calc')
+        self.optimizer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='hedge-opt')
         self._risk_generation = 0
         self._risk_key = None
         self._risk_running = False
@@ -822,7 +837,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
 
         plan_box = ttk.LabelFrame(risk_panel, text='建议补单方案', padding=10)
         plan_box.grid(row=0, column=1, sticky='nsew')
-        plan_box.rowconfigure(1, weight=1)
+        plan_box.rowconfigure(2, weight=1)
         plan_box.columnconfigure(0, weight=1)
         plan_toolbar = ttk.Frame(plan_box)
         plan_toolbar.grid(row=0, column=0, sticky='ew', pady=(0, 6))
@@ -835,21 +850,41 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.plan_plus_button = ttk.Button(plan_toolbar, text='+', width=3,
                                            command=lambda: self.adjust_plan(1))
         self.plan_plus_button.pack(side='right')
-        self.actual_hedge_checkbox = ttk.Checkbutton(
-            plan_toolbar, text='已补单', variable=self.hedge_confirmed,
-            command=self._toggle_actual_hedge)
+        # V276: avoid Windows checkbutton X; display a literal check mark.
+        self.actual_hedge_checkbox = ttk.Button(
+            plan_toolbar, text='□ 已补单', width=10, command=self._click_actual_hedge)
         self.actual_hedge_checkbox.pack(side='right', padx=(5, 12))
         self.plan = tk.Text(plan_box, height=10, wrap='word', bg='white',
                             relief='solid', bd=1, fg=INK,
                             font=('Microsoft YaHei UI', 11))
-        self.plan.grid(row=1, column=0, sticky='nsew')
+        viewbar=ttk.Frame(plan_box)
+        viewbar.grid(row=1,column=0,sticky='ew',pady=(0,5))
+        ttk.Label(viewbar,text='方案选择').pack(side='left',padx=(0,5))
+        self.plan_mode_combo=ttk.Combobox(viewbar,textvariable=self.plan_mode_choice,
+             values=['人工方案','低成本','均衡型','收益优先'],state='readonly',width=10)
+        self.plan_mode_combo.pack(side='left')
+        self.plan_mode_combo.bind('<<ComboboxSelected>>',self._switch_plan_mode)
+        self.adopt_auto_button=ttk.Button(viewbar,text='采用当前方案',command=self._adopt_selected_auto)
+        self.adopt_auto_button.pack(side='right')
+        self.plan.grid(row=2, column=0, sticky='nsew')
+        self.plan.bind('<<Modified>>', self._on_plan_text_modified)
+        self.plan.edit_modified(False)
         plan_row = ttk.Frame(plan_box)
-        plan_row.grid(row=2, column=0, sticky='ew', pady=(8, 0))
+        plan_row.grid(row=3, column=0, sticky='ew', pady=(8, 0))
         self.plan_note = ttk.Label(plan_row, text='')
         self.plan_note.pack(side='left')
         self.copy_button = ttk.Button(plan_row, text='一键复制',
                                       style='Accent.TButton', command=self.copy_plan)
         self.copy_button.pack(side='right')
+        self.sort_plan_button=ttk.Button(plan_row,text='排序整理',command=self._sort_plan_editor)
+        self.sort_plan_button.pack(side='right',padx=(0,6))
+        self.optimizer_compare_label=ttk.Label(plan_box,text='自动方案：等待风险数据',
+                                       foreground=MUTED,wraplength=550,justify='left')
+        self.optimizer_compare_label.grid(row=4,column=0,sticky='ew',pady=(7,0))
+        self.restore_system_plan_button = ttk.Button(
+            plan_row, text='恢复系统方案', command=self._restore_system_plan)
+        self.restore_system_plan_button.pack(side='right', padx=(0, 8))
+        self.plan_note.configure(wraplength=240)
 
     @staticmethod
     def tree(parent, columns):
@@ -1098,7 +1133,12 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.period_combo.configure(values=periods)
         inputs = self.controller.analysis_inputs(lottery,records)
         # Only financial inputs affect the 1000-outcome calculation; queue/status changes reuse it.
-        signature = repr((self.controller.period,lottery,inputs))
+        # V277: changing external pricing invalidates optimizer candidates.
+        cfg = self.controller.settings
+        signature = repr((self.controller.period,lottery,inputs,
+                         cfg['direct_unit_cost'][lottery],
+                         cfg['external_direct_prize'][lottery],
+                         cfg['external_leopard_direct_prize'][lottery]))
         if signature == self._risk_key:
             self.update_status()
             return
@@ -1146,6 +1186,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 self.set_text(self.sources, '点选风险号码，再点下方投注行查看原始消息和赔付计算依据。')
             self.risk_info.configure(text=f'{len(self.snapshot.risks)}个号码达到当前筛选条件  ·  点击号码查看原始投注与赔付依据')
             self.locate_risk_number()
+            self._queue_optimizer()
             self._render_plan()
             if re.fullmatch(r'[0-9]{3}', self.draw_number.get().strip()):
                 self.calculate_draw(silent=True)
@@ -1210,37 +1251,125 @@ class RiskApp(ShortcutMixin, tk.Tk):
             return None
         return None
 
+    # V276-COMBINED-RECOGNITION-EDITABLE-HEDGE
+    def _click_actual_hedge(self):
+        self.hedge_confirmed.set(not self.hedge_confirmed.get())
+        self._toggle_actual_hedge()
+
+    def _show_hedge_checkbox(self):
+        self.actual_hedge_checkbox.configure(
+            text='✓ 已补单' if self.hedge_confirmed.get() else '□ 已补单')
+
+    def _set_editable_plan_text(self, value):
+        value = str(value)
+        current = self.plan.get('1.0', 'end-1c')
+        if current == value:
+            return
+        self._plan_editor_block = True
+        try:
+            index = self.plan.index('insert')
+            self.plan.configure(state='normal')
+            self.plan.delete('1.0', 'end')
+            self.plan.insert('1.0', value)
+            self.plan.edit_modified(False)
+            if self._plan_manual_mode:
+                try:
+                    self.plan.mark_set('insert', index)
+                except tk.TclError:
+                    pass
+        finally:
+            self._plan_editor_block = False
+
+    def _on_plan_text_modified(self, event=None):
+        if not self.plan.edit_modified():
+            return
+        self.plan.edit_modified(False)
+        if self._plan_editor_block or self._closing:
+            return
+        self._plan_manual_mode = True
+        self._plan_manual_text = self.plan.get('1.0', 'end-1c')
+        if self._plan_edit_timer is not None:
+            self.after_cancel(self._plan_edit_timer)
+        self.plan_note.configure(text='正在核对手动方案…', foreground=MUTED)
+        self._plan_edit_timer = self.after(170, self._commit_manual_plan)
+
+    def _commit_manual_plan(self):
+        self._plan_edit_timer = None
+        if self._closing or not self._draw_context:
+            return
+        context = self._draw_context
+        self._plan_manual_mode = True
+        self._plan_manual_text = self.plan.get('1.0', 'end-1c')
+        self._ui_state.put_manual_plan(*context, self._plan_manual_text)
+        self._render_plan()
+        self._render_risk_rows()
+        self._update_financial_cards()
+
+    def _restore_system_plan_v276(self):
+        if self._plan_manual_mode and not messagebox.askyesno(
+                '恢复系统方案',
+                '将用当前系统计算的建议方案替换手动填写的内容。\n'
+                '已补单仍保持勾选，并同步按恢复后的方案重算实际盈亏。\n确定恢复？',
+                parent=self):
+            return
+        if self._plan_edit_timer is not None:
+            self.after_cancel(self._plan_edit_timer)
+            self._plan_edit_timer = None
+        self._plan_manual_mode = False
+        self._plan_manual_text = None
+        self._plan_edit_error = ''
+        self._ui_state.put_manual_plan(self.lottery.get(), self.controller.period, None)
+        self._render_plan()
+        self._render_risk_rows()
+        self._update_financial_cards()
+
+    def _update_actual_hedge_from_plan(self):
+        # User-selected live accounting: valid active plan replaces the previous
+        # saved actual purchase immediately, without unchecking the control.
+        if not self.hedge_confirmed.get() or self._plan_edit_error or not self._plan_rows:
+            return
+        if not self.snapshot:
+            return
+        lottery = self.lottery.get()
+        settings = self.controller.settings
+        try:
+            purchase = freeze_purchase_snapshot(
+                self._plan_rows,
+                settings['direct_unit_cost'][lottery],
+                settings['external_direct_prize'][lottery],
+                settings['external_leopard_direct_prize'][lottery])
+            if purchase is None:
+                raise ValueError('当前没有可计费的有效补单号码')
+            previous = self._ui_state.get_actual_hedge(lottery, self.controller.period)
+            if previous != purchase:
+                self._ui_state.put_actual_hedge(lottery, self.controller.period, purchase)
+        except (ValueError, TypeError, KeyError) as exc:
+            self._plan_edit_error = '无法同步已补单：' + str(exc)
+
     def _toggle_actual_hedge(self):
-        """只在手动勾选当时冻结已买方案；加减模拟倍数不修改已买记录。"""
         scope = (self.lottery.get(), self.controller.period)
         if self.hedge_confirmed.get():
-            if not self.snapshot:
+            if not self.snapshot or self._plan_edit_error or not self._plan_rows:
                 self.hedge_confirmed.set(False)
-                messagebox.showwarning('不能确认补单', '请先等待实时风险计算完成。', parent=self)
+                self._show_hedge_checkbox()
+                messagebox.showwarning('不能确认补单',
+                    '请先完成有效抛单方案并等待风险计算完成。' +
+                    ('\n'+self._plan_edit_error if self._plan_edit_error else ''), parent=self)
                 return
-            settings = self.controller.settings
-            lottery = self.lottery.get()
-            try:
-                purchase = freeze_purchase_snapshot(
-                    self._adjusted_plan_rows(),
-                    settings['direct_unit_cost'][lottery],
-                    settings['external_direct_prize'][lottery],
-                    settings['external_leopard_direct_prize'][lottery])
-                if purchase is None:
-                    self.hedge_confirmed.set(False)
-                    messagebox.showwarning('不能确认补单', '当前没有正倍数补单号码。', parent=self)
-                    return
-                self._ui_state.put_actual_hedge(*scope, purchase)
-            except (TypeError, ValueError, KeyError) as exc:
+            self._update_actual_hedge_from_plan()
+            if self._plan_edit_error or self._ui_state.get_actual_hedge(*scope) is None:
                 self.hedge_confirmed.set(False)
-                messagebox.showwarning('补单保存失败', str(exc), parent=self)
+                self._show_hedge_checkbox()
+                messagebox.showwarning('无法保存已补单',
+                    self._plan_edit_error or '本次没有保存成功', parent=self)
                 return
         else:
-            existing = self._ui_state.get_actual_hedge(*scope)
-            if existing and not messagebox.askyesno(
-                    '取消已补单', '确认清除此日期的已补单记录？\n'
-                    '清除后今日总盈亏将不再计入这笔补单的成本和中奖收入。', parent=self):
+            previous = self._ui_state.get_actual_hedge(*scope)
+            if previous and not messagebox.askyesno(
+                    '取消已补单', '清除该日期当前已补单记录？\n这会停止计算补单成本和收入。',
+                    parent=self):
                 self.hedge_confirmed.set(True)
+                self._show_hedge_checkbox()
                 return
             self._ui_state.put_actual_hedge(*scope, None)
         self._render_plan()
@@ -1251,50 +1380,314 @@ class RiskApp(ShortcutMixin, tk.Tk):
             return []
         return adjust_plan_rows(self.snapshot.risks, self._plan_adjustment)
 
-    def _render_plan(self):
-        lottery = self.lottery.get()
-        self._plan_rows = self._adjusted_plan_rows()
-        text = plan_text(
-            self._plan_rows,
-            self.controller.settings['direct_unit_cost'][lottery],
-            lottery
-        )
-        if self.snapshot and self.snapshot.pending:
-            text = ('[仅供人工核对 / 不可作为正式补单依据]\n'
-                    '当前统计不完整，存在未确认投注；不得直接按此方案下注。\n\n' + text)
-        self.set_text(self.plan, text)
-        purchased = self._ui_state.get_actual_hedge(
-            self.lottery.get(), self.controller.period)
-        if purchased:
-            note = (f'已补单 · {sum(x[1] for x in purchased["rows"])}注 · '
-                    f'成本{yuan_fmt(purchased["cost_cents"] / 100)}元')
-        else:
-            note = '未实际补单 · 建议方案仅模拟'
-        self.plan_note.configure(text=note)
-        self.plan_adjust_label.configure(
-            text=f'全局调整：{self._plan_adjustment:+d}倍 · 新增号码沿用当前倍数')
-        has_plan = any(row.plan_multiplier > 0 for row in self._plan_rows)
-        can_decrease = any(row.plan_multiplier > 1 for row in self._plan_rows)
-        can_increase = bool(self.snapshot and any(
-            row.plan_multiplier > 0 for row in self.snapshot.risks))
-        self.plan_minus_button.configure(state='normal' if can_decrease else 'disabled')
-        # 即使当前已减到0倍，仍允许+按钮恢复基础建议倍数。
-        self.plan_plus_button.configure(state='normal' if can_increase else 'disabled')
-        self.copy_button.configure(
-            text=('复制核对草稿' if self.snapshot and self.snapshot.pending else '一键复制'),
-            state='normal' if has_plan else 'disabled')
+    # V277-THREE-PROFILES-SORTED-HEDGE
+    _OPT_MODE_LABELS = {
+        'manual':'人工方案', 'cheap':'低成本',
+        'balanced':'均衡型', 'profit':'收益优先',
+    }
 
-    def adjust_plan(self, delta):
-        # 全局调整所有补单组；每次±1，最低不低于0倍。
-        if not self.snapshot or not self._plan_rows:
+    def _optimizer_rows(self, mode):
+        if not self.snapshot:
+            return []
+        result = getattr(self, '_auto_optimizer_results', {}).get(mode)
+        if not result:
+            return []
+        lookup = {str(row.number): row for row in self.snapshot.risks}
+        rows = []
+        for number, multiple in sorted(result['bets'].items()):
+            base = lookup.get(number)
+            if base is not None:
+                rows.append(RiskRow(number, base.payout, base.net_loss, multiple))
+            else:
+                payout = float(self.snapshot.payouts.get(number, 0))
+                rows.append(RiskRow(number, payout, payout - self.snapshot.revenue/100, multiple))
+        return rows
+
+    def _update_optimizer_comparison(self):
+        result = getattr(self, '_auto_optimizer_results', {})
+        if not self.snapshot:
+            message='自动方案：等待风险数据'
+        elif getattr(self, '_auto_optimizer_error', ''):
+            message='自动方案不可用：'+self._auto_optimizer_error[:130]
+        elif not result:
+            message='三种方案正在根据完整1000个号码计算…'
+        else:
+            fragments=[]
+            for key in ('cheap','balanced','profit'):
+                item=result.get(key)
+                if item:
+                    fragments.append('%s %s元｜最差%s元｜补中最低%s元｜%s个亏损'
+                        % (self._OPT_MODE_LABELS[key],
+                           yuan_fmt(item['cost_cents']/100),
+                           ('+' if item['worst_profit_cents']>=0 else '')+yuan_fmt(item['worst_profit_cents']/100),
+                           ('+' if item['covered_min_profit_cents']>=0 else '')+yuan_fmt(item['covered_min_profit_cents']/100)
+                             if item['covered_min_profit_cents'] is not None else '未覆盖',
+                           item['loss_count']))
+            message='     '.join(fragments)
+        if hasattr(self, 'optimizer_compare_label'):
+            self.optimizer_compare_label.configure(text=message)
+
+    def _queue_optimizer(self):
+        self._auto_optimizer_generation += 1
+        generation = self._auto_optimizer_generation
+        self._auto_optimizer_results = {}
+        self._auto_optimizer_error = ''
+        self._update_optimizer_comparison()
+        if not self.snapshot or self._closing:
             return
-        if int(delta) < 0 and not any(row.plan_multiplier > 1 for row in self._plan_rows):
+        context = (self.lottery.get(), self.controller.period)
+        settings = self.controller.settings
+        try:
+            # Immutable copy: never pass Tk widgets, database handles, or live
+            # mutable controller/settings objects to the optimizer thread.
+            income = int(self.snapshot.revenue)
+            payouts = {str(k):cents(v) for k,v in self.snapshot.payouts.items()}
+            unit = cents(settings['direct_unit_cost'][context[0]])
+            normal = cents(settings['external_direct_prize'][context[0]])
+            leopard = cents(settings['external_leopard_direct_prize'][context[0]])
+        except (ValueError, KeyError, TypeError) as exc:
+            self._auto_optimizer_error = str(exc)
+            self._update_optimizer_comparison()
             return
-        self._plan_adjustment += 1 if int(delta) > 0 else -1
-        self._save_ui_scope()
+        queue_ref = self.events
+        def work():
+            try:
+                output = optimize_three_profiles(income,payouts,unit,normal,leopard)
+                queue_ref.put(('optimizer_ready',generation,context,output,''))
+            except Exception as exc:
+                queue_ref.put(('optimizer_ready',generation,context,None,str(exc)))
+        self.optimizer_pool.submit(work)
+
+    def _apply_optimizer_ready(self, generation, context, output, error):
+        if generation != self._auto_optimizer_generation or context != (self.lottery.get(), self.controller.period) or self._closing:
+            return
+        self._auto_optimizer_error = error or ''
+        self._auto_optimizer_results = {r['key']:r for r in (output or [])} if not error else {}
+        self._update_optimizer_comparison()
+        if self._plan_mode != 'manual':
+            self._render_plan()
+            self._render_risk_rows()
+            self._update_financial_cards()
+
+    def _switch_plan_mode(self, event=None):
+        lookup = {v:k for k,v in self._OPT_MODE_LABELS.items()}
+        selected=lookup.get(self.plan_mode_choice.get(), 'manual')
+        if selected==self._plan_mode:
+            return
+        # Switching views is simulation-only; never rewrites a purchased plan.
+        if self._plan_edit_timer is not None:
+            self.after_cancel(self._plan_edit_timer)
+            self._plan_edit_timer=None
+            if self._draw_context and self._plan_manual_mode:
+                text=self.plan.get('1.0','end-1c')
+                self._plan_manual_text=text
+                self._ui_state.put_manual_plan(*self._draw_context,text)
+        self._plan_mode=selected
+        self._last_plan_signature=None  # prevent view switch being mistaken for purchase edit
+        self._ui_state.put_hedge_mode(self.lottery.get(),self.controller.period,selected)
         self._render_plan()
         self._render_risk_rows()
         self._update_financial_cards()
+
+    def _adopt_selected_auto(self):
+        if self._plan_mode=='manual':
+            messagebox.showinfo('人工方案', '当前已经是人工方案，可直接编辑或复制。', parent=self)
+            return
+        if not self.snapshot or self.snapshot.pending:
+            messagebox.showwarning('不能采用', '投注识别尚未完整确认，不能把自动草稿标记为有效方案。',parent=self)
+            return
+        if self._plan_edit_error or not self._plan_rows:
+            messagebox.showwarning('不能采用', '自动方案尚未计算完成或没有有效号码。',parent=self)
+            return
+        lottery = self.lottery.get()
+        text = plan_text(self._plan_rows,self.controller.settings['direct_unit_cost'][lottery],lottery)
+        if self.hedge_confirmed.get():
+            if not messagebox.askyesno('采用自动方案',
+                  '已补单处于勾选状态。采用后将按新方案实时同步实际补单成本和返奖。\n'
+                  '请先确认这些号码和倍数确实已经购买。继续吗？', parent=self):
+                return
+        self._plan_manual_text=text
+        self._plan_manual_mode=True
+        self._ui_state.put_manual_plan(lottery,self.controller.period,text)
+        self._plan_mode='manual'
+        self.plan_mode_choice.set(self._OPT_MODE_LABELS['manual'])
+        self._ui_state.put_hedge_mode(lottery,self.controller.period,'manual')
+        self._last_plan_signature=None
+        self._render_plan()
+        if self.hedge_confirmed.get():
+            self._update_actual_hedge_from_plan()  # explicit adoption only
+        self._render_risk_rows()
+        self._update_financial_cards()
+
+    def _sort_plan_editor(self):
+        if self._plan_mode!='manual':
+            messagebox.showinfo('无需整理', '自动方案已经按每组号码从小到大排序。', parent=self)
+            return
+        lottery = self.lottery.get()
+        try:
+            # Parse every ticket before reformatting; never drop unresolved text.
+            rows,_ = parse_hedge_text(self.plan.get('1.0','end-1c'),lottery,
+                        self.controller.settings['direct_unit_cost'][lottery])
+            text = plan_text(rows,self.controller.settings['direct_unit_cost'][lottery],lottery)
+        except (ValueError, TypeError, KeyError) as exc:
+            messagebox.showwarning('无法排序', '方案包含未识别内容：'+str(exc),parent=self)
+            return
+        self._plan_manual_mode=True
+        self._plan_manual_text=text
+        self._ui_state.put_manual_plan(lottery,self.controller.period,text)
+        self._render_plan()
+        self._render_risk_rows()
+        self._update_financial_cards()
+
+    def _restore_system_plan(self):
+        original=self._plan_mode
+        self._plan_mode='manual'
+        self.plan_mode_choice.set(self._OPT_MODE_LABELS['manual'])
+        self._last_plan_signature=None
+        self._restore_system_plan_v276()
+        if self._plan_manual_mode:  # restore confirmation cancelled
+            self._plan_mode=original
+            self.plan_mode_choice.set(self._OPT_MODE_LABELS[original])
+            self._render_plan()
+        else:
+            self._ui_state.put_hedge_mode(self.lottery.get(),self.controller.period,'manual')
+            if self.hedge_confirmed.get():
+                self._update_actual_hedge_from_plan()  # explicit restore action
+        self._render_risk_rows()
+        self._update_financial_cards()
+
+    def _render_plan(self):
+        if self._plan_mode=='manual':
+            self.plan.configure(state='normal')
+            self.actual_hedge_checkbox.configure(state='normal')
+            self._render_plan_v276()
+            self._update_optimizer_comparison()
+            self.adopt_auto_button.configure(state='disabled')
+            return
+        # Read-only preview: absolutely no write to actual_hedges.
+        self._plan_rows = self._optimizer_rows(self._plan_mode)
+        self._plan_edit_error = ''
+        lottery=self.lottery.get()
+        if self._plan_rows:
+            text=plan_text(self._plan_rows,
+                   self.controller.settings['direct_unit_cost'][lottery],lottery)
+            if self.snapshot and self.snapshot.pending:
+                text=('[仅供人工核对 / 不可作为正式补单依据]\n'
+                      '当前统计不完整，存在未确认投注。\n\n'+text)
+            info=self._auto_optimizer_results.get(self._plan_mode)
+            note=('%s · 成本%s元 · 共%s个号码 · 仅模拟预览，不改变实际已补单'
+                  % (self._OPT_MODE_LABELS[self._plan_mode],
+                     yuan_fmt(info['cost_cents']/100),info['covered_count']))
+            self.adopt_auto_button.configure(state='normal' if not self.snapshot.pending else 'disabled')
+        else:
+            text='自动方案正在计算，请先查看人工方案。' if not self._auto_optimizer_error else ('自动方案失败：'+self._auto_optimizer_error)
+            note='自动方案未完成，不计入已购买补单'
+            self.adopt_auto_button.configure(state='disabled')
+            self._plan_edit_error='自动计算中或未生成方案'
+        self._set_editable_plan_text(text)
+        self.plan.configure(state='disabled')
+        self.actual_hedge_checkbox.configure(state='disabled')
+        self.plan_note.configure(text=note,foreground=MUTED)
+        self.plan_adjust_label.configure(text='三种自动候选可切换 · 采用前不修改已补单')
+        self.plan_minus_button.configure(state='disabled')
+        self.plan_plus_button.configure(state='disabled')
+        self.copy_button.configure(
+            text='复制核对草稿' if self.snapshot and self.snapshot.pending else '一键复制',
+            state='normal' if self._plan_rows else 'disabled')
+        self._update_optimizer_comparison()
+
+    def _render_plan_v276(self):
+        lottery = self.lottery.get()
+        setting = self.controller.settings
+        system_rows = self._adjusted_plan_rows()
+        self._plan_edit_error = ''
+        if self._plan_manual_mode:
+            text = self._plan_manual_text if self._plan_manual_text is not None else ''
+            try:
+                self._plan_rows, current_cost = parse_hedge_text(
+                    text, lottery, setting['direct_unit_cost'][lottery])
+                fixed_text = update_display_total(text, current_cost)
+                if fixed_text != text:
+                    text = fixed_text
+                    self._plan_manual_text = fixed_text
+                    if self._draw_context:
+                        self._ui_state.put_manual_plan(*self._draw_context, fixed_text)
+            except (ValueError, TypeError, KeyError) as exc:
+                self._plan_rows = []
+                self._plan_edit_error = str(exc)
+        else:
+            self._plan_rows = system_rows
+            text = plan_text(self._plan_rows,
+                             setting['direct_unit_cost'][lottery], lottery)
+            if self.snapshot and self.snapshot.pending:
+                text = ('[仅供人工核对 / 不可作为正式补单依据]\n'
+                        '当前统计不完整，存在未确认投注；不得直接按此方案下注。\n\n'+text)
+        self._set_editable_plan_text(text)
+        # Do not rewrite a stored historical actual purchase merely because a
+        # date was opened. Synchronize only after a real active-plan change or
+        # when the user explicitly clicks 已补单.
+        current_signature = (
+            self.lottery.get(), self.controller.period, self._plan_manual_mode,
+            tuple(sorted((row.number, int(row.plan_multiplier)) for row in self._plan_rows)),
+            str(setting['direct_unit_cost'][lottery]),
+            str(setting['external_direct_prize'][lottery]),
+            str(setting['external_leopard_direct_prize'][lottery]))
+        previous_signature = getattr(self, '_last_plan_signature', None)
+        if self.snapshot and previous_signature is not None and current_signature != previous_signature:
+            self._update_actual_hedge_from_plan()
+        self._last_plan_signature = current_signature if self.snapshot else None
+        self._show_hedge_checkbox()
+        purchased = self._ui_state.get_actual_hedge(lottery, self.controller.period)
+        if self._plan_edit_error:
+            note = '方案未生效：' + self._plan_edit_error[:110]
+        elif purchased and self.hedge_confirmed.get():
+            note = ('✓ 已补单 · '
+                    f'{sum(item[1] for item in purchased["rows"])}注 · '
+                    f'成本{yuan_fmt(purchased["cost_cents"]/100)}元 · 实时随方案更新')
+        else:
+            note = '手动方案（未实际补单）' if self._plan_manual_mode else '系统建议（未实际补单）'
+        if self.snapshot and self.snapshot.pending:
+            note += ' · 注意：尚有未确认投注'
+        self.plan_note.configure(text=note, foreground=RED if self._plan_edit_error else MUTED)
+        self.plan_adjust_label.configure(
+            text=('手动方案 · 编辑后自动计算' if self._plan_manual_mode else
+                  f'系统方案 · 全局{self._plan_adjustment:+d}倍'))
+        has_plan = bool(self._plan_rows) and not self._plan_edit_error
+        can_decrease = any(row.plan_multiplier > 1 for row in self._plan_rows)
+        can_increase = has_plan if self._plan_manual_mode else bool(
+            self.snapshot and any(r.plan_multiplier > 0 for r in self.snapshot.risks))
+        self.plan_minus_button.configure(state='normal' if can_decrease else 'disabled')
+        self.plan_plus_button.configure(state='normal' if can_increase else 'disabled')
+        self.copy_button.configure(
+            text=('复制核对草稿' if self.snapshot and self.snapshot.pending else '一键复制'),
+            state='normal' if has_plan and self.snapshot else 'disabled')
+
+    def adjust_plan(self, delta):
+        if self._plan_mode!='manual':
+            return  # candidate preview is never editable with +/-
+        if not self.snapshot or not self._plan_rows or self._plan_edit_error:
+            return
+        direction = 1 if int(delta) > 0 else -1
+        if direction < 0 and not any(row.plan_multiplier > 1 for row in self._plan_rows):
+            return
+        if self._plan_manual_mode:
+            # All active manual ticket lines change together; the generated
+            # display's total is regenerated, never copied from stale text.
+            rows = [RiskRow(row.number, row.payout, row.net_loss,
+                            max(0, int(row.plan_multiplier) + direction))
+                    for row in self._plan_rows]
+            self._plan_manual_text = plan_text(
+                rows, self.controller.settings['direct_unit_cost'][self.lottery.get()],
+                self.lottery.get())
+            self._ui_state.put_manual_plan(self.lottery.get(), self.controller.period,
+                                           self._plan_manual_text)
+        else:
+            self._plan_adjustment += direction
+            self._save_ui_scope()
+        self._render_plan()
+        self._render_risk_rows()
+        self._update_financial_cards()
+
 
     def _simulate_risk_draw(self):
         # 未输入实际开奖号码时，使用选中高风险号码作开奖前假设试算。
@@ -1346,6 +1739,12 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self.cards['payout'].configure(fg=RED)
             return
 
+        if self._plan_edit_error:
+            self.cards['payout'].configure(
+                text=yuan_fmt(preview['payout_yuan']) + '元', fg=RED)
+            for key in ('scheme_profit','scheme_income','total_profit'):
+                self.cards[key].configure(text='待核对', fg=RED)
+            return
         lottery = self.lottery.get()
         settings = self.controller.settings
         result = plan_financials(
@@ -1390,6 +1789,18 @@ class RiskApp(ShortcutMixin, tk.Tk):
         context = (self.lottery.get(), self.controller.period)
         if self._draw_context == context:
             return
+        # Persist pending manual typing before changing lottery/period.
+        previous_context = self._draw_context
+        if previous_context and self._plan_manual_mode:
+            self._ui_state.put_manual_plan(*previous_context, self.plan.get('1.0', 'end-1c'))
+        if self._plan_edit_timer is not None:
+            self.after_cancel(self._plan_edit_timer)
+            self._plan_edit_timer = None
+        self._auto_optimizer_generation += 1
+        self._auto_optimizer_results = {}
+        self._auto_optimizer_error = ''
+        self._plan_mode = self._ui_state.get_hedge_mode(*context)
+        self.plan_mode_choice.set(self._OPT_MODE_LABELS[self._plan_mode])
         self._draw_context = context
         self._draw_lookup_request += 1
         self._draw_busy = False
@@ -1399,6 +1810,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._draw_online = None
         self._draw_preview = None
         remembered = self._ui_state.get_scope(*context)
+        self._plan_manual_text = self._ui_state.get_manual_plan(*context)
+        self._plan_manual_mode = self._plan_manual_text is not None
+        self._plan_edit_error = ''
+        self._last_plan_signature = None
         self.hedge_confirmed.set(
             self._ui_state.get_actual_hedge(*context) is not None)
         self._plan_adjustment = remembered['adjustment']
@@ -2222,6 +2637,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 if self.events.empty():
                     break
                 event = self.events.get_nowait()
+                if event[0] == 'optimizer_ready':
+                    _, generation, context, result, error = event
+                    self._apply_optimizer_ready(generation, context, result, error)
+                    continue
                 if event[0] == 'draw_lookup':
                     _, rid, lottery, period, result, error = event
                     self._apply_draw_lookup(rid, lottery, period, result, error)
@@ -2430,6 +2849,14 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.copy_risk_numbers_button.configure(
             state='normal' if self.snapshot.risks else 'disabled')
         rows = adjust_plan_rows(self.snapshot.risks, self._plan_adjustment)
+        if self._plan_mode!='manual' and not self._plan_edit_error:
+            manual = {row.number: row.plan_multiplier for row in self._plan_rows}
+            for row in rows:
+                row.plan_multiplier = manual.get(row.number, 0)
+        elif getattr(self, '_plan_manual_mode', False) and not self._plan_edit_error:
+            manual = {row.number: row.plan_multiplier for row in self._plan_rows}
+            for row in rows:
+                row.plan_multiplier = manual.get(row.number, 0)
         key = self._risk_sort_key
         keyfunc = {
             'number': lambda r: r.number,
@@ -2561,13 +2988,16 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def copy_plan(self):
         if not self.snapshot or self._risk_running or self._risk_next:
             return
-        if not any(r.plan_multiplier for r in self.snapshot.risks):
+        if not self._plan_rows or self._plan_edit_error:
             return
         # Copy the displayed text, never a hidden unmarked official plan.
         # On unresolved orders this contains the mandatory draft warning.
-        text = self.plan.get('1.0', 'end-1c')
+        # Clipboard content always sorted, even if the manual editor is not.
+        text = plan_text(self._plan_rows,
+            self.controller.settings['direct_unit_cost'][self.lottery.get()],
+            self.lottery.get())
         if self.snapshot.pending and '[仅供人工核对 / 不可作为正式补单依据]' not in text:
-            return
+            text = '[仅供人工核对 / 不可作为正式补单依据]\n' + text
         self.clipboard_clear()
         self.clipboard_append(text)
         self.update_idletasks()
@@ -3329,6 +3759,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._ui_state.data['window_zoomed'] = self.state() == 'zoomed'
         self._ui_state.save()
         self._save_ui_scope()
+        if self._plan_edit_timer is not None:
+            self.after_cancel(self._plan_edit_timer)
+            self._plan_edit_timer = None
+        if self._plan_manual_mode and self._draw_context:
+            self._ui_state.put_manual_plan(*self._draw_context, self.plan.get('1.0', 'end-1c'))
         self._closing = True
         if self._timer:
             self.after_cancel(self._timer)
@@ -3349,6 +3784,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.wechat.stop()
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.risk_pool.shutdown(wait=False, cancel_futures=True)
+        self.optimizer_pool.shutdown(wait=False, cancel_futures=True)
         # Cancel every pending timer in this window's Tcl interpreter before child
         # widgets delete their registered callback commands (including after_idle layout).
         for timer in self.tk.call('after','info'):

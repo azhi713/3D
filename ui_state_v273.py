@@ -15,6 +15,7 @@ class UIStateV273:
     def __init__(self, path):
         self.path = Path(path)
         self.data = {'schema': 1, 'scopes': {}, 'hidden_periods': [], 'actual_hedges': {},
+                     'manual_hedge_plans': {}, 'risk_split': {}, 'hedge_modes': {},
                      'period_range': '7', 'window_geometry': '', 'window_zoomed': False}
         try:
             loaded = json.loads(self.path.read_text(encoding='utf-8'))
@@ -22,7 +23,8 @@ class UIStateV273:
                 self.data.update({key: loaded[key] for key in self.data if key in loaded})
         except (OSError, ValueError, TypeError):
             pass
-        for key, default in (('scopes', {}), ('hidden_periods', []), ('actual_hedges', {})):
+        for key, default in (('scopes', {}), ('hidden_periods', []), ('actual_hedges', {}),
+                             ('manual_hedge_plans', {}), ('risk_split', {}), ('hedge_modes', {})):
             if not isinstance(self.data[key], type(default)):
                 self.data[key] = default
         if self.data['period_range'] not in ('7', '30', 'all'):
@@ -43,6 +45,35 @@ class UIStateV273:
             self.data['actual_hedges'].pop(key, None)
         else:
             self.data['actual_hedges'][key] = normalized
+        self.save()
+
+    # V276-COMBINED-RECOGNITION-EDITABLE-HEDGE
+    # V277-THREE-PROFILES-SORTED-HEDGE
+    def get_hedge_mode(self, lottery, period):
+        key = str(lottery) + '|' + str(period)
+        mode = self.data.get('hedge_modes', {}).get(key, 'manual')
+        return mode if mode in ('manual','cheap','balanced','profit') else 'manual'
+
+    def put_hedge_mode(self, lottery, period, mode):
+        if mode not in ('manual','cheap','balanced','profit'):
+            raise ValueError('未知的自动补单模式')
+        key = str(lottery) + '|' + str(period)
+        self.data.setdefault('hedge_modes', {})[key] = mode
+        self.save()
+
+    def get_manual_plan(self, lottery, period):
+        key = str(lottery) + '|' + str(period)
+        saved = self.data.get('manual_hedge_plans', {}).get(key)
+        return saved if isinstance(saved, str) and len(saved) <= 80000 else None
+
+    def put_manual_plan(self, lottery, period, text):
+        key = str(lottery) + '|' + str(period)
+        if text is not None and (not isinstance(text, str) or len(text) > 80000):
+            raise ValueError('手动抛单方案不是有效文本或过长')
+        if text is None:
+            self.data['manual_hedge_plans'].pop(key, None)
+        else:
+            self.data['manual_hedge_plans'][key] = text
         self.save()
 
     def get_scope(self, lottery, period):

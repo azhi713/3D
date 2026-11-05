@@ -159,7 +159,8 @@ class BetParser:
 
     def parse(self, lottery, text):
         # V275-LOCAL-DIRECT-BLOCKS: 本地优先确认完整多行直选订单，失败不回退猜单。
-        from local_direct_blocks_v275 import parse_local_blocks
+        # V276-COMBINED-RECOGNITION-EDITABLE-HEDGE: local-first, strict fallback
+        from local_blocks_v276 import parse_local_blocks
         recognized = parse_local_blocks(self, lottery, text)
         if recognized is not None:
             return recognized

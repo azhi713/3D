@@ -200,7 +200,8 @@ def plan_text(rows, unit_cost=2, lottery='福彩'):
     paragraphs = []
     for multiplier in sorted(groups, reverse=True):
         amount = format(multiplier, 'f').rstrip('0').rstrip('.') if multiplier % 1 else str(int(multiplier))
-        numbers = groups[multiplier]
+        # V277: stable ascending 000..999 inside every multiplier group.
+        numbers = sorted(groups[multiplier], key=lambda v: int(v))
         lines = [prefix+'直选'+amount+'倍']
         lines += ['  '.join(numbers[i:i+12]) for i in range(0,len(numbers),12)]
         paragraphs.append('\n'.join(lines))

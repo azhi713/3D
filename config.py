@@ -2,7 +2,7 @@
 from copy import deepcopy
 
 APP_NAME = "彩票实时风险预警"
-APP_VERSION = "V2.7.5-多行直选_大底金额本地识别"
+APP_VERSION = 'V2.7.7-三档自动优化_补单排序'
 ENGINE_VERSION = "V2.7.1-ai-context-receipt"
 RULES_VERSION = "2026-10-26-catalog+2026-10-31-overlay-v2"
 
