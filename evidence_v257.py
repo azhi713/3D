@@ -366,6 +366,8 @@ def verify_candidate_bet(fragment,bet,amount_kind,declared_amount=None):
 def declared_total(source):
     hits=list(_TOTAL_PATTERN.finditer(_normalize(source)))
     if hits:return _decimal(hits[-1][1])
+    compact=re.search(r"合\s*[:：]?\s*(\d+(?:\.\d{1,2})?)\s*[元米块]?\s*$",_normalize(source))
+    if compact:return _decimal(compact[1])
     # A trailing independent number after a sentence boundary can be a total.
     m=re.search(r'[。！!，,]\s*(\d+(?:\.\d{1,2})?)\s*[元米块]?\s*[。！!]*$',_normalize(source))
     return _decimal(m[1]) if m else None

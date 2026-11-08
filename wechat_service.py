@@ -46,6 +46,9 @@ class WeChatService:
         self.self_name = ''
 
     def _persist(self, payload):
+        # V281-THRESHOLD-SOURCE-CONTEXT-NO-HEDGE
+        from wechat_text_v281 import normalize_payload
+        payload = normalize_payload(payload)
         if not isinstance(payload, dict):
             raise ValueError('消息须为JSON对象')
         for key in ('message_id', 'group_id', 'text'):
@@ -70,6 +73,10 @@ class WeChatService:
             history=bool(payload.get('history', False)),
             is_self=bool(payload.get('is_self', False)),
         )
+        # Preserve the complete native envelope separately from parsing text.
+        for field in ('transport_original_text', 'sender_prefix', 'sender_prefix_proof', 'transport_source'):
+            if field in payload:
+                clean[field] = payload[field]
         if clean['is_self'] and self.config.get('filter_self', True):
             return False
         inserted = DataStore.enqueue(self.db_path, clean)
@@ -241,17 +248,24 @@ class WeChatService:
         if not text:
             return False
         sender = str(msg.get('sender_username') or msg.get('sender_wxid') or msg.get('sender_id') or '')
+        from wechat_text_v281 import split_sender
+        # Keep fallback message_id compatible with the unpatched callback.
+        native_original_text = str(msg.get('content', ''))
+        legacy_sender = sender
+        legacy_hash_text = re.sub(r'^wxid_[^:\r\n]{1,128}:\s*(?:\r?\n)?', '', text, count=1).strip()
+        cleaned_message = split_sender(text, sender, group_id, trusted_database=True)
+        text, sender = cleaned_message.text, cleaned_message.sender
         is_self = self._is_self_message(msg, sender)
         if is_self and self.config.get('filter_self', True):
             return False
         # 部分微信4.x数据库记录会把群内发送者前缀放进正文。
-        text = re.sub(r'^wxid_[^:\r\n]{1,128}:\s*(?:\r?\n)?', '', text, count=1).strip()
+        # Prefix removal was verified against sender/native group metadata above.
         if not text:
             return False
         stable = msg.get('server_id') or msg.get('msg_svr_id') or msg.get('msg_id') or msg.get('local_id') or msg.get('sort_seq')
         if stable is None:
-            digest = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
-            stable = f"{msg.get('create_time','')}:{sender}:{digest}"
+            digest = hashlib.sha256(legacy_hash_text.encode('utf-8')).hexdigest()[:16]
+            stable = f"{msg.get('create_time','')}:{legacy_sender}:{digest}"
         payload = {
             'message_id': f'wx4:{group_id}:{stable}',
             'group_id': group_id,
@@ -262,6 +276,11 @@ class WeChatService:
             'history': bool(history),
             'is_self': is_self,
         }
+        payload['transport_source'] = 'wechat4'
+        if cleaned_message.prefix:
+            payload['transport_original_text'] = native_original_text
+            payload['sender_prefix'] = cleaned_message.prefix
+            payload['sender_prefix_proof'] = cleaned_message.proof
         return self._persist(payload)
 
     def _wechat4_loop(self):

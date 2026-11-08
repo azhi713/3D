@@ -489,7 +489,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._style()
         self._build()
         if self._ui_state.data.get('window_zoomed'):
-            self.after(80, lambda: self.state('zoomed'))
+            self.after(80, self._v280_restore_zoom)
         self._install_shortcuts()
         self.bind_all('<KeyPress>', self._on_risk_adjust_hotkey, add='+')
         self.refresh()
@@ -3755,9 +3755,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         if self._closing:
             return
         self._save_risk_split()
-        self._ui_state.put_window_geometry(self.geometry())
-        self._ui_state.data['window_zoomed'] = self.state() == 'zoomed'
-        self._ui_state.save()
+        self._v280_store_window_state()
         self._save_ui_scope()
         if self._plan_edit_timer is not None:
             self.after_cancel(self._plan_edit_timer)
@@ -3809,3 +3807,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
 # V2732-EQUAL-METRIC-DRAW-CARDS
 
 # V2734-COPY-AND-REAL-HEDGE
+
+# V280-EIGHT-CARDS-FOUR-PLAN-DASHBOARD
+# Explicit UI-only adapter: the preceding business implementation is retained.
+from dashboard_v283 import DashboardV283Mixin as _DashboardV280Mixin  # V283-DISPLAY-SNAPSHOT-PROFIT-TARGET
+class RiskApp(_DashboardV280Mixin, RiskApp):
+    """V2.8.0 UI adapter, legacy business methods inherited unchanged."""
+    pass

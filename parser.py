@@ -38,6 +38,9 @@ def _summary_lottery(line):
 
 def split_lottery_message(text, default_lottery):
     """按显式“福/3D/体/排”等标记拆分彩种；未标记内容沿用默认彩种。"""
+    # V281: trailing lottery directive belongs to its own unfinished pool.
+    from source_context_v281 import normalize_layout
+    text = normalize_layout(text)
     raw = unicodedata.normalize('NFKC', text or '')
     from routing_v260 import split_shared_total
     shared = split_shared_total(raw, default_lottery)
@@ -158,6 +161,21 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        # V281-THRESHOLD-SOURCE-CONTEXT-NO-HEDGE
+        # V282-SHARED-ORDER-COPY-SCOPE
+        from shared_orders_v282 import parse_shared_order
+        shared_order = parse_shared_order(self, lottery, text)
+        if shared_order is not None:
+            return shared_order
+        from source_context_v281 import parse_context
+        v281_result = parse_context(self, lottery, text)
+        if v281_result is not None:
+            return v281_result
+        # V278-SOURCE-ALIAS-ALL-PLAY: strict local cash / fraction aliases.
+        from recognition_alias_v278 import parse_alias_v278
+        alias_v278 = parse_alias_v278(self, lottery, text)
+        if alias_v278 is not None:
+            return alias_v278
         # V275-LOCAL-DIRECT-BLOCKS: 本地优先确认完整多行直选订单，失败不回退猜单。
         # V276-COMBINED-RECOGNITION-EDITABLE-HEDGE: local-first, strict fallback
         from local_blocks_v276 import parse_local_blocks

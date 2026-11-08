@@ -17,6 +17,14 @@ class UIStateV273:
         self.data = {'schema': 1, 'scopes': {}, 'hidden_periods': [], 'actual_hedges': {},
                      'manual_hedge_plans': {}, 'risk_split': {}, 'hedge_modes': {},
                      'period_range': '7', 'window_geometry': '', 'window_zoomed': False}
+        # V283-DISPLAY-SNAPSHOT-PROFIT-TARGET: include target in persisted-key allowlist.
+        self.data.setdefault('target_profit_yuan', '')
+        # V281-THRESHOLD-STEP-SETTING: include in persisted-key allowlist.
+        self.data.setdefault('threshold_step_yuan', '1000')
+        # V280-EIGHT-CARDS-FOUR-PLAN-DASHBOARD: loaded JSON may contain these keys.
+        self.data.setdefault('purchased_hedge_modes', {})
+        self.data.setdefault('normal_window_geometry', '')
+        self.data.setdefault('window_geometry_schema', 0)
         try:
             loaded = json.loads(self.path.read_text(encoding='utf-8'))
             if isinstance(loaded, dict):
@@ -29,6 +37,10 @@ class UIStateV273:
                 self.data[key] = default
         if self.data['period_range'] not in ('7', '30', 'all'):
             self.data['period_range'] = '7'
+        if not isinstance(self.data.get('purchased_hedge_modes'), dict):
+            self.data['purchased_hedge_modes'] = {}
+        if not isinstance(self.data.get('normal_window_geometry'), str):
+            self.data['normal_window_geometry'] = ''
 
     # V2734: 实际已买补单与实时风险模拟分开保存。
     def get_actual_hedge(self, lottery, period):
@@ -100,19 +112,8 @@ class UIStateV273:
         self.save()
 
     def get_window_geometry(self, screen_w, screen_h):
-        raw = self.data.get('window_geometry', '')
-        if not isinstance(raw, str):
-            return ''
-        match = WINDOW_RE.fullmatch(raw)
-        if not match:
-            return ''
-        w, h, x, y = map(int, match.groups())
-        # 避免分辨率变化后窗口落到屏幕以外。
-        if not 900 <= w <= max(900, screen_w) or not 590 <= h <= max(590, screen_h):
-            return ''
-        if x < -w + 150 or x > screen_w - 100 or y < -50 or y > screen_h - 100:
-            return ''
-        return raw
+        from dashboard_metrics_v280 import restored_geometry
+        return restored_geometry(self.data, screen_w, screen_h)
 
     def put_window_geometry(self, raw):
         if isinstance(raw, str) and WINDOW_RE.fullmatch(raw):
@@ -151,6 +152,28 @@ class UIStateV273:
             if temp_name:
                 try: os.unlink(temp_name)
                 except OSError: pass
+
+    def get_purchased_mode(self, lottery, period):
+        if self.get_actual_hedge(lottery, period) is None:
+            return None
+        key = str(lottery)+'|'+str(period)
+        mode = self.data.get('purchased_hedge_modes', {}).get(key, 'manual')
+        return mode if mode in ('manual','cheap','balanced','profit') else 'manual'
+
+    def put_purchased_plan(self, lottery, period, snapshot, mode):
+        if mode not in ('manual','cheap','balanced','profit'):
+            raise ValueError('未知的已补单方案')
+        normalized = normalize_purchase_snapshot(snapshot)
+        if snapshot is not None and normalized is None:
+            raise ValueError('已补单快照无效')
+        key = str(lottery)+'|'+str(period)
+        if normalized is None:
+            self.data['actual_hedges'].pop(key, None)
+            self.data['purchased_hedge_modes'].pop(key, None)
+        else:
+            self.data['actual_hedges'][key] = normalized
+            self.data['purchased_hedge_modes'][key] = mode
+        self.save()
 
 
 def visible_periods(active_periods, today, current, hidden, mode='7'):

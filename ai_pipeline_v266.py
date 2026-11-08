@@ -349,6 +349,9 @@ def _one_candidate(item, parser, lottery, source):
 
 def _observed(source, bets):
     """Conservative independent completeness checks; never reparses source."""
+    from shared_orders_v282 import complete_shared_evidence
+    if complete_shared_evidence(source, bets):
+        return True, '共享指令及完整原文覆盖已由程序核验'
     if not bets:return False,'未获取可信投注'
     tokens=[]
     for m in re.finditer(r'(?<!\d)\d{3}(?!\d)',source):
@@ -393,6 +396,11 @@ def _observed(source, bets):
 
 
 def decode_structured(source, candidate, parser, lottery):
+    # V282-SHARED-ORDER-COPY-SCOPE: deterministic source scope, not model guesses.
+    from shared_orders_v282 import decode_shared_candidates
+    shared = decode_shared_candidates(source, candidate, parser, lottery)
+    if shared is not None:
+        return shared
     try:
         payload,items,errors=_v267_normalize_input(source,candidate)
     except (ValueError,TypeError,KeyError,EvidenceError) as exc:

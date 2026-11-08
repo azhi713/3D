@@ -349,6 +349,9 @@ class Controller:
             bet.source_span.setdefault('reference','current_text')
 
     def parse_record(self, record, allow_conflict=False):
+        # V281-THRESHOLD-SOURCE-CONTEXT-NO-HEDGE: explicit reparse repairs old envelopes.
+        from wechat_text_v281 import repair_record
+        repair_record(record)
         parser = self.parser_for_record(record)
         text = self.settings.get('aliases', {}).get(record.raw_text.strip(), record.raw_text)
         bets, normalized, reason = parser.parse(record.lottery, text)
@@ -1020,6 +1023,10 @@ class Controller:
                                   created_at=payload.get('received_at'), period=payload['period'])
                 self.store.mark_inbox_processed(inbox_id)
                 if record:
+                    from wechat_text_v281 import annotate_received
+                    for received_record in self.last_added_records:
+                        if annotate_received(received_record, payload):
+                            self.store.update(received_record, '微信发送人前缀与投注正文分离')
                     added.extend(self.last_added_records)
             except (ValueError, OSError) as exc:
                 if '21:14已截止' in str(exc):
