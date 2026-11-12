@@ -15,26 +15,28 @@ MODES = ('manual', 'cheap', 'balanced', 'profit')
 
 
 def parse_profit_target(value: str) -> int | None:
-    """Blank disables the target; zero means break-even or better. Unit: cents."""
+    """Blank disables the target; negative values are loss thresholds. Unit: cents."""
     if not isinstance(value, str):
-        raise ValueError('目标盈利须为非负金额，最多两位小数')
+        raise ValueError('目标盈亏须为有效金额，最多两位小数')
     text = value.strip()
     if not text:
         return None
-    if not re.fullmatch(r'[0-9]+(?:\.[0-9]{1,2})?', text):
-        raise ValueError('目标盈利须为非负金额，最多两位小数')
-    return amount_cents(text)
+    if not re.fullmatch(r'-?[0-9]+(?:\.[0-9]{1,2})?', text):
+        raise ValueError('目标盈亏须为有效金额，最多两位小数')
+    # Keep the regular principal parser nonnegative; only the target may be signed.
+    return -amount_cents(text[1:]) if text.startswith('-') else amount_cents(text)
 
 
 def target_outcomes(metrics: PlanMetrics, target_cents: int | None) -> tuple[str, ...] | None:
+    """Count profit >= positive target, or loss >= absolute negative target."""
     if target_cents is None:
         return None
-    if type(target_cents) is not int or target_cents < 0:
-        raise ValueError('目标盈利须为非负整数分')
+    if type(target_cents) is not int:
+        raise ValueError('目标盈亏须为整数分')
     if len(metrics.profits_cents) != 1000:
-        raise ValueError('目标盈利需要完整1000个开奖结果')
+        raise ValueError('目标盈亏需要完整1000个开奖结果')
     return tuple(f'{n:03d}' for n, profit in enumerate(metrics.profits_cents)
-                 if profit >= target_cents)
+                 if (profit <= target_cents if target_cents < 0 else profit >= target_cents))
 
 
 @dataclass(frozen=True)

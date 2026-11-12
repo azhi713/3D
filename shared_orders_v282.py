@@ -27,6 +27,7 @@ VALUE = (r'(?:[0-9]+/[0-9]+|[零〇一二两三四五六七八九十百千万]+�
 UNIT = r'(?:倍|元|米|块|毛|角|分)'
 OP = re.compile(rf'(?P<play>{PLAY})?(?P<each>各)?(?:打|买|投)?(?P<value>{VALUE})(?P<unit>{UNIT})?', re.I)
 COUNT = re.compile(r'(?P<count>[0-9]+)注(?P<tail>.*)\Z')
+COUNT_GROUP_MULT = re.compile(rf'(?:共)?(?P<count>[0-9]+)组(?P<multiple>{VALUE})倍\Z')
 RECEIPT = re.compile(r'(?:合计|总计|小计|合|共)[:：]?(?P<value>[0-9]+(?:\.[0-9]{1,2})?)(?:元|米|块)?[。!！]*\Z')
 NUMBERS = re.compile(r'[0-9]{1,9}(?:[\s,，、/]+[0-9]{1,9})*\Z')
 FORBIDDEN = re.compile(r'撤单|取消|更正|改成|不买|作废|不要|减掉|删除')
@@ -59,6 +60,7 @@ class Group:
     operations: tuple[Operation, ...] | None = None
     instruction: Line | None = None
     batch: int | None = None
+    strict_count: bool = False
 
 
 @dataclass
@@ -149,7 +151,10 @@ def parse_structure(lottery: str, original: str):
     if re.search(r'定位|胆拖|[0-9]胆|和值|合值|跨度|全包|包全|转圈打|豹子', original):
         return None
     inline = re.compile(r'^(?:'+LOT+r')?\s*[0-9]{1,9}(?:[ \t,，、/]+[0-9]{1,9})*\s*(?:'+PLAY+r')', re.I)
-    if any(inline.match(unicodedata.normalize('NFKC', line.raw)) for line in lines):
+    # A bare "2组30倍" is a strict count summary only when it is the entire
+    # line and follows a pure-number pool. Do not mistake it for inline 组选.
+    if any(inline.match(unicodedata.normalize('NFKC', line.raw)) and
+           not COUNT_GROUP_MULT.fullmatch(canonical(line.raw)) for line in lines):
         return None
     # Only pure number blocks enter this additive grammar. Legacy inline forms
     # (e.g. 123直选1倍) remain on their original, independently tested path.
@@ -169,11 +174,11 @@ def parse_structure(lottery: str, original: str):
     grand_line = None
     finished = False
 
-    def flush(count=None, summary=None):
+    def flush(count=None, summary=None, strict_count=False):
         nonlocal pending, pending_lines
         if not pending:
             raise ValueError('注数/玩法说明前没有对应的号码块')
-        g = Group(pending, pending_lines, count, summary)
+        g = Group(pending, pending_lines, count, summary, strict_count=strict_count)
         groups.append(g)
         pending, pending_lines = [], []
         return g
@@ -200,6 +205,18 @@ def parse_structure(lottery: str, original: str):
             pending_lines.append(line)
             if sum(len(g.codes) for g in groups) + len(pending) > MAX_ITEMS:
                 raise ValueError('本单号码条目超过4000，请核对重复粘贴')
+            continue
+        count_group = COUNT_GROUP_MULT.fullmatch(s)
+        if count_group:
+            if active is not None:
+                raise ValueError('同组前置倍数与后置组数倍数冲突，须人工核对')
+            g = flush(int(count_group['count']), line, strict_count=True)
+            # "组" is the number of listed three-digit entries, not 组选.
+            # Following the existing pure-number-list convention, play=直选.
+            spec = instructions(count_group['multiple']+'倍', default_direct=True)
+            if spec is None or not spec[0] or len(spec[0]) != 1:
+                raise ValueError('组数汇总缺少唯一、明确的倍数')
+            bind([g], spec[0], line, None)
             continue
         cm = COUNT.fullmatch(s)
         if cm:
@@ -396,6 +413,8 @@ def parse_shared_order(parser, lottery, original):
         for index, group in enumerate(groups, 1):
             rows = next(rows for g, rows in group_results if g is group)
             if group.count is not None and group.count != len(group.codes):
+                if group.strict_count:
+                    raise ValueError(f'第{index}组声明{group.count}组，实际{len(group.codes)}组；未将该组投注入账')
                 warnings.append(f'核对提醒：第{index}组填写{group.count}注，实际{len(group.codes)}注；已按实际号码及明确定价核算{amount(rows):g}元，请核对是否漏列号码')
                 for b in rows:
                     b.source_span['count_discrepancy'] = {'declared': group.count, 'actual': len(group.codes)}

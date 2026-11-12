@@ -16,9 +16,16 @@ _LOT = r'(?:体彩排列三|福彩3[Dd]|排列三|福彩|体彩|3[Dd]|福|体|�
 _PLAY = r'(?:直选|单选|直|单)'
 _MULT = r'(?:半|\d+(?:\.\d{1,2})?|[零〇一二两三四五六七八九十百千万]+)'
 _CODE_RE = re.compile(r'(?<![0-9])[0-9]{3}(?![0-9])')
-_LIST_RE = re.compile(r'[0-9]{3}(?:[\s,，、]+[0-9]{3})*\Z')
+_LIST_RE = re.compile(r'[0-9]{3}(?:[\s,，、_]+[0-9]{3})*\Z')
+_INLINE_COUNTED = re.compile(
+    rf'(?P<codes>[0-9]{{3}}(?:[\s,，、_]+[0-9]{{3}})+)'
+    rf'[ \t]*(?P<summary>{_LOT}[ \t]*\d{{1,4}}[ \t]*注.*)\Z', re.I)
 _HEAD_RE = re.compile(rf'(?P<head>.*?)(?P<multiple>{_MULT})倍\Z',re.I)
 _COUNT_RE = re.compile(rf'(?P<lot>{_LOT})?(?P<count>\d{{1,4}})注(?P<tail>.*)\Z',re.I)
+# Lines like "共515组8倍" and "2组30倍" declare the number of three-digit entries,
+# not the 组选 play. The surrounding number list keeps the parser's established
+# default 直选 meaning. Neither 组 alone nor a guessed total is sufficient.
+_COUNT_GROUP_MULT_RE = re.compile(rf'(?:共)?(?P<count>\d{{1,4}})组(?P<multiple>{_MULT})倍\Z', re.I)
 _TOKENS = re.compile(rf'{_LOT}|{_PLAY}',re.I)
 _TOTAL_RE = re.compile(r'(?:(?:合计|总计|合|共)[:：]?)(\d+(?:\.\d{1,2})?)(?:元|米|块)?\Z')
 _ONLY_TOTAL = re.compile(r'(?:(?:合计|总计|合|共)[:：]?)(\d+(?:\.\d{1,2})?)(?:元|米|块)?\Z')
@@ -89,6 +96,10 @@ def _parse_pricing(tail, lottery, allow_no_play=False):
 
 def _summary(line,lottery):
     s=_compact(line)
+    count_group=_COUNT_GROUP_MULT_RE.fullmatch(s)
+    if count_group:
+        return {'count':int(count_group.group('count')),
+                'mode':'multiple','value':count_group.group('multiple'),'declared':None}
     m=_COUNT_RE.fullmatch(s)
     if not m:
         return None
@@ -111,6 +122,25 @@ def _summary(line,lottery):
 
 def _line_items(raw):
     return [(m.group(),m.start()) for m in re.finditer(r'[^\r\n]+',raw) if m.group().strip()]
+
+
+def _inline_counted_items(raw):
+    """Split one-line counted direct orders without altering original code spans.
+
+    The lottery marker and explicit 注-count are mandatory at the joined tail.
+    Other free text and ambiguous glued numbers remain on the existing path.
+    """
+    result=[]
+    for line,pos in _line_items(raw):
+        trimmed=line.strip()
+        m=_INLINE_COUNTED.fullmatch(trimmed)
+        if m:
+            offset=pos+len(line)-len(line.lstrip())
+            result.extend([(m.group('codes'),offset+m.start('codes')),
+                           (m.group('summary'),offset+m.start('summary'))])
+        else:
+            result.append((line,pos))
+    return result
 
 
 def _num_mult(parser,raw,value,mode,unit):
@@ -145,7 +175,7 @@ def _fail(parser,raw,error):
 def parse_local_blocks(parser,lottery,raw):
     if not isinstance(raw,str) or not raw.strip() or lottery not in ('福彩','体彩'):
         return None
-    entries=_line_items(raw)
+    entries=_inline_counted_items(raw)
     if len(entries)<2:
         return _legacy_local_blocks(parser,lottery,raw)
     try:

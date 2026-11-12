@@ -42,6 +42,19 @@ def normalize_layout(text):
     lines=text.replace('\r\n','\n').replace('\r','\n').split('\n')
     out=[]; i=0
     while i<len(lines):
+        # A trailing lottery/position instruction belongs to exactly the
+        # preceding complete 百/十/个 block. Move only its lottery marker to
+        # the front for routing; leave each position and its digits intact.
+        if i+3<len(lines) and all(re.fullmatch(
+                rf'\s*{position}(?:位)?\s*[:：]?\s*[0-9]{{1,10}}\s*', lines[i+index])
+                for index,position in enumerate('百十个')):
+            last=compact(lines[i+3])
+            tail=re.match(rf'(?P<lot>{LOT})(?=定位|三码定位)',last,re.I)
+            if tail:
+                out.extend([tail['lot']+lines[i].strip(),lines[i+1],lines[i+2],
+                            last[tail.end():]])
+                i+=4
+                continue
         m=PURE.fullmatch(compact(lines[i]))
         if not m:
             out.append(lines[i]);i+=1;continue
@@ -55,7 +68,15 @@ def normalize_layout(text):
                 out.append(lines[i]);i+=1;continue
             directive=compact(lines[j])
             if second:directive=directive[len(second):]
-            out.append((second or first or '')+m['code']+directive)
+            # Distinct pools separated by whitespace are distinct purchases,
+            # never one concatenated 8/9-digit pool (1358 0358 != 13580358).
+            spaced=re.fullmatch(rf'(?:(?:{LOT})\s*)?([0-9]{{3,9}}(?:\s+[0-9]{{3,9}})+)\s*',
+                                unicodedata.normalize('NFKC', lines[i]).strip(),re.I)
+            if spaced:
+                prefix=(second or first or '')
+                out.append((prefix+'\n' if prefix else '')+' '.join(spaced[1].split())+'\n'+directive)
+            else:
+                out.append((second or first or '')+m['code']+directive)
             i=j+1
         else:
             out.append(lines[i]);i+=1

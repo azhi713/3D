@@ -134,6 +134,45 @@ def parse_shared_context(parser, lottery, current_text, original_text):
     """
     if not original_text or original_text == current_text:
         return None
+    # Earlier versions routed the trailing '直选各2倍' only to the second
+    # colour. Reparse those saved per-colour fragments using the immutable
+    # whole-message source, but only for the exact two-pool shared directive.
+    from routing_v260 import split_shared_total
+    paired = split_shared_total(original_text, lottery)
+    if paired is not None:
+        sections, grand = paired
+        if set(sections) == {'福彩', '体彩'}:
+            lines = {lot: [line.strip() for line in part.splitlines() if line.strip()]
+                     for lot, part in sections.items()}
+            if (all(len(item) == 2 for item in lines.values()) and
+                lines['福彩'][1] == lines['体彩'][1] and
+                re.fullmatch(r'(?:直选|单选|直|单)\s*各\s*'
+                             r'(?:半|\d+(?:\.\d{1,2})?|[一二两三四五六七八九十]+)\s*倍',
+                             lines['福彩'][1], re.I)):
+                selected = sections[lottery]
+                previous = lines[lottery][0]
+                if _canonical(current_text).strip() in (
+                        _canonical(selected).strip(), _canonical(previous).strip()):
+                    from parser import BetParser
+                    other_lot = '体彩' if lottery == '福彩' else '福彩'
+                    other_parser = BetParser(parser.rules)
+                    other_bets, _, other_error = other_parser.parse(
+                        other_lot, sections[other_lot])
+                    bets, normalized, error = parser.parse(lottery, selected)
+                    total = (sum(cents(b.principal) for b in bets) +
+                             sum(cents(b.principal) for b in other_bets))
+                    if not error and not other_error and bets and other_bets and total == cents(grand):
+                        for bet in bets:
+                            # The shared multiplier is not in the saved
+                            # per-colour fragment; its true source is the
+                            # original complete incoming message.
+                            bet.source_span = {
+                                'start': 0, 'end': len(original_text),
+                                'text': original_text,
+                                'reference': 'source_original_text',
+                                'granularity': 'shared_directive',
+                            }
+                        return bets, normalized, '据双彩完整接收原文复核直选各倍数'
     from parser import split_lottery_message, lottery_from_token
     original = _canonical(original_text)
     pieces = [x.strip() for x in original.splitlines() if x.strip()]

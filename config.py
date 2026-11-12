@@ -4,7 +4,7 @@ from copy import deepcopy
 APP_NAME = "彩票实时风险预警"
 APP_VERSION = 'V2.8.3-方案显示复制一致_目标盈利统计'
 ENGINE_VERSION = "V2.7.1-ai-context-receipt"
-RULES_VERSION = "2026-10-26-catalog+2026-10-31-overlay-v2"
+RULES_VERSION = "2026-11-09-photo-supported-plays-v1"
 
 LOTTERY_FC = "福彩"
 LOTTERY_TC = "体彩"
@@ -278,7 +278,7 @@ BASE_RULES = {
     "两码定位": {"principal": 10, "prize": 900},
     "三码定位": {"principal": 2, "prize": 1800},
 
-    "四码组六": {"principal": 10, "prize": 370},
+    "四码组六": {"principal": 10, "prize": 360},
     "五码组六": {"principal": 10, "prize": 150},
     "六码组六": {"principal": 10, "prize": 75},
     "七码组六": {"principal": 10, "prize": 43},
@@ -300,20 +300,20 @@ BASE_RULES = {
     "四码复试": {"principal": 10, "prize": 140},
     "五码复试": {"principal": 10, "prize": 72},
     "六码复试": {"principal": 10, "prize": 41},
-    "七码复试": {"principal": 10, "prize": 26},
+    "七码复试": {"principal": 10, "prize": 25},
     "八码复试": {"principal": 10, "prize": 17},
     "九码复试": {"principal": 10, "prize": 12},
 
     "跨度0": {"principal": 10, "prize": 800},
-    "跨度1": {"principal": 10, "prize": 157},
-    "跨度2": {"principal": 10, "prize": 88},
-    "跨度3": {"principal": 10, "prize": 67},
-    "跨度4": {"principal": 10, "prize": 58},
-    "跨度5": {"principal": 10, "prize": 56},
-    "跨度6": {"principal": 10, "prize": 58},
-    "跨度7": {"principal": 10, "prize": 67},
-    "跨度8": {"principal": 10, "prize": 88},
-    "跨度9": {"principal": 10, "prize": 157},
+    "跨度1": {"principal": 10, "prize": 165},
+    "跨度2": {"principal": 10, "prize": 92},
+    "跨度3": {"principal": 10, "prize": 72},
+    "跨度4": {"principal": 10, "prize": 62},
+    "跨度5": {"principal": 10, "prize": 60},
+    "跨度6": {"principal": 10, "prize": 63},
+    "跨度7": {"principal": 10, "prize": 72},
+    "跨度8": {"principal": 10, "prize": 93},
+    "跨度9": {"principal": 10, "prize": 170},
 }
 
 # Excel未区分彩种赔率，以相同初始值分别保存；界面可独立调整。

@@ -1,0 +1,220 @@
+"""以分计算金额；只枚举真实开奖号码，组六的排列不会重复赔付。"""
+from functools import lru_cache
+from fractions import Fraction
+from decimal import Decimal
+from config import RULES_BY_LOTTERY
+from models import RiskRow, cents, money
+from itertools import permutations, combinations
+from math import prod
+
+RESULTS = tuple(f'{i:03d}' for i in range(1000))
+
+
+@lru_cache(maxsize=1024)
+def winning_indices(play, selection, span0_wins):
+    out = []
+    for index, result in enumerate(RESULTS):
+        unique = set(result)
+        size = len(unique)
+        if size == 1 and not play.startswith('和值') and play not in ('直选', '独胆', '一码定位', '两码定位', '三码定位', '豹子', '跨度0'):
+            continue
+        win = False
+        if play == '直选':
+            win = result == selection
+        elif play in ('组三（组选）', '组六（组选）'):
+            win = size == (2 if play.startswith('组三') else 3) and sorted(result) == sorted(selection)
+        elif play == '独胆':
+            win = selection in result
+        elif play == '双飞':
+            # 双飞相同数字必须在开奖号码中出现至少两次；豹子按现有规则另行排除。
+            win = (result.count(selection[0]) >= 2 if selection[0] == selection[1]
+                   else set(selection).issubset(unique))
+        elif play == '对子':
+            win = result.count(selection[0]) == 2
+        elif play == '豹子':
+            win = size == 1
+        elif play.endswith('码定位'):
+            parts = [part.split(':') for part in selection.split('|')]
+            win = all(result['百十个'.index(position)] in numbers for position, numbers in parts)
+        elif play == '全包组六':
+            win = size == 3
+        elif play == '全包组三':
+            win = size == 2
+        elif play in ('组六复式','组三复式'):
+            win=size==(3 if play=='组六复式' else 2) and unique.issubset(set(selection))
+        elif play.startswith('和值'):
+            win=sum(map(int,result))==int(play[2:])
+        elif play.startswith('1胆'):
+            dan,tuo=selection.split(':')
+            win=size==(3 if play.endswith('组6') else 2) and dan in unique and (unique-{dan}).issubset(set(tuo))
+        elif play.endswith('码组六'):
+            win = size == 3 and unique.issubset(set(selection))
+        elif play.endswith('码组三'):
+            win = size == 2 and unique.issubset(set(selection))
+        elif play.endswith('码复试'):
+            # 复试按规则表：所选数字池覆盖组三+组六（包含对子），豹子按总规则全杀。
+            win = size in (2, 3) and unique.issubset(set(selection))
+        elif play.startswith('跨度'):
+            win = max(map(int, result))-min(map(int, result)) == int(play[-1])
+        if win:
+            out.append(index)
+    return tuple(out)
+
+
+class RiskEngine:
+    def __init__(self, rules=None, policy=None):
+        self.rules = rules or RULES_BY_LOTTERY
+        self.policy = policy or {}
+
+    def payout_for(self, lottery, bet, result):
+        if result not in RESULTS:
+            raise ValueError('开奖号码须为三位数字')
+        wins = winning_indices(bet.play, bet.selection, bool(self.policy.get('span0_wins')))
+        if int(result) not in wins:
+            return 0
+        return (int(round(self.prize_cents(lottery, bet, result) * float(bet.multiplier)))
+                * self._position_ticket_count(bet, result)) / 100
+
+    @staticmethod
+    def _position_ticket_count(bet, result):
+        """Count repeated positional purchases without losing their payouts."""
+        if not bet.play.endswith('码定位'):
+            return 1
+        return prod(digits.count(result['百十个'.index(position)])
+                    for position, digits in (part.split(':') for part in bet.selection.split('|')))
+
+    def prize_cents(self, lottery, bet, result):
+        rule = self.rules[lottery][bet.play]
+        if bet.play in ('组六复式','组三复式'):
+            # 组六命中6条不同排列；组三命中同一重复数组的3条排列。
+            return cents(rule['prize'])*(6 if bet.play=='组六复式' else 3)
+        return cents(rule.get('leopard_prize',1600) if bet.play in ('直选','三码定位') and len(set(result)) == 1 else rule['prize'])
+
+    @staticmethod
+    def expanded_tickets(bet):
+        if bet.play=='组六复式':
+            return tuple(''.join(items) for items in permutations(bet.selection,3))
+        if bet.play=='组三复式':
+            return tuple(sorted({''.join(items) for pair in combinations(bet.selection,2)
+                                 for repeated in pair for items in permutations(repeated*2+next(d for d in pair if d!=repeated))}))
+        return (bet.selection,)
+
+    def calculate(self, lottery, bets, threshold, external_direct_prize, revenue=None,
+                  metric='payout', hedge_cost=None, unit_cost=2, leopard_direct_prize=1600):
+        threshold_cents = cents(threshold)
+        reward = cents(external_direct_prize)
+        leopard_reward = cents(leopard_direct_prize)
+        unit = cents(unit_cost)
+        if min(reward,leopard_reward) <= 0 or (hedge_cost and min(reward,leopard_reward) <= unit):
+            raise ValueError('外部直选奖金须大于零，计入补单成本时须高于每倍成本')
+        if metric not in ('payout', 'net_loss'):
+            raise ValueError('未知风险筛选方式')
+        total_principal = sum(cents(b.principal) for b in bets)
+        revenue_cents = total_principal if revenue is None else cents(revenue)
+        payouts = [0] * 1000
+        for bet in bets:
+            prize = int(round(self.prize_cents(lottery, bet, bet.selection) * float(bet.multiplier)))
+            for index in winning_indices(bet.play, bet.selection, bool(self.policy.get('span0_wins'))):
+                actual=(int(round(self.prize_cents(lottery,bet,RESULTS[index])*float(bet.multiplier)))
+                        if bet.play=='三码定位' and index%111==0 else prize)
+                payouts[index] += actual * self._position_ticket_count(bet, RESULTS[index])
+        rows = []
+        for result, payout in zip(RESULTS, payouts):
+            loss = payout - revenue_cents
+            result_reward = leopard_reward if len(set(result)) == 1 else reward
+            if (payout if metric == 'payout' else loss) >= threshold_cents:
+                rows.append(RiskRow(result, payout/100, loss/100, max(0, (max(loss, 0)+result_reward-1)//result_reward)))
+        # 严格成本模式：所有补单共用的总成本也纳入每一种开奖情形。
+        # 最小整数固定点，不能只扣中奖号码自己的补单成本。
+        if hedge_cost:
+            rewards = [leopard_reward if len(set(row.number)) == 1 else reward for row in rows]
+            if sum((Fraction(unit, r) for r in rewards), Fraction()) >= 1:
+                raise ValueError('风险号码过多，计入全部补单成本后无法生成有效覆盖方案')
+            multipliers = [r.plan_multiplier for r in rows]
+            for _ in range(10000):
+                total_cost = sum(multipliers) * unit
+                updated = [max(0, (int(round(row.net_loss*100))+total_cost+row_reward-1)//row_reward) for row,row_reward in zip(rows,rewards)]
+                if updated == multipliers:
+                    break
+                multipliers = updated
+            else:
+                raise ValueError('补单成本计算未收敛，请调整阈值')
+            for row, multiplier in zip(rows, multipliers):
+                row.plan_multiplier = multiplier
+        rows.sort(key=lambda row: (-row.net_loss, row.number))
+        return total_principal/100, rows, dict(zip(RESULTS, (p/100 for p in payouts)))
+
+    def explain(self, lottery, bets, result):
+        rows = []
+        for bet in bets:
+            payout = self.payout_for(lottery, bet, result)
+            if payout:
+                rows.append({**bet.to_dict(), 'payout': payout})
+        return sorted(rows, key=lambda row: -row['payout'])
+
+
+# V272-PLAN-SIMULATION
+def adjust_plan_rows(rows, delta=0):
+    # 全局调整所有建议补单倍数；最低为0，0倍组不进入方案。
+    delta = int(delta)
+    adjusted = []
+    for row in rows:
+        base = int(row.plan_multiplier)
+        multiplier = max(0, base + delta) if base > 0 else 0
+        adjusted.append(RiskRow(row.number, row.payout, row.net_loss, multiplier))
+    return adjusted
+
+
+def plan_financials(rows, draw, unit_cost, direct_prize, leopard_prize):
+    # 使用设置页的外部返奖和每倍成本，不另建赔率规则。
+    unit = Decimal(str(unit_cost))
+    cost_cents = sum(
+        cents(unit * Decimal(str(row.plan_multiplier)))
+        for row in rows if int(row.plan_multiplier) > 0
+    )
+    valid_draw = (isinstance(draw, str) and len(draw) == 3 and
+                  draw.isascii() and draw.isdigit())
+    if not valid_draw:
+        return {'cost_cents': cost_cents, 'income_cents': None,
+                'profit_cents': None, 'hit_count': 0}
+    reward = Decimal(str(leopard_prize if len(set(draw)) == 1 else direct_prize))
+    income_cents = 0
+    hit_count = 0
+    for row in rows:
+        if str(row.number) == draw and int(row.plan_multiplier) > 0:
+            income_cents += cents(reward * Decimal(str(row.plan_multiplier)))
+            hit_count += 1
+    return {'cost_cents': cost_cents, 'income_cents': income_cents,
+            'profit_cents': income_cents - cost_cents, 'hit_count': hit_count}
+
+
+def calculate_total_profit_cents(today_income_cents, actual_payout_cents, plan_result):
+    # 今日总盈亏 = 今日收入 - 原投注实际赔付 + 补单方案收入 - 补单方案成本。
+    if plan_result.get('income_cents') is None:
+        return None
+    return (int(today_income_cents) - int(actual_payout_cents)
+            + int(plan_result['income_cents']) - int(plan_result['cost_cents']))
+
+
+def plan_text(rows, unit_cost=2, lottery='福彩'):
+    """Display only. Group identical multiples; leave risk arithmetic unchanged."""
+    from collections import defaultdict
+    from decimal import Decimal
+    groups = defaultdict(list)
+    for row in rows:
+        if Decimal(str(row.plan_multiplier)) > 0:
+            groups[Decimal(str(row.plan_multiplier))].append(str(row.number))
+    if not groups:
+        return '暂无需要补单的号码'
+    prefix = '体' if lottery in ('体彩', '体彩排列三', '排') else '福'
+    paragraphs = []
+    for multiplier in sorted(groups, reverse=True):
+        amount = format(multiplier, 'f').rstrip('0').rstrip('.') if multiplier % 1 else str(int(multiplier))
+        # V277: stable ascending 000..999 inside every multiplier group.
+        numbers = sorted(groups[multiplier], key=lambda v: int(v))
+        lines = [prefix+'直选'+amount+'倍']
+        lines += ['  '.join(numbers[i:i+12]) for i in range(0,len(numbers),12)]
+        paragraphs.append('\n'.join(lines))
+    cost = sum((Decimal(str(row.plan_multiplier)) for row in rows if row.plan_multiplier>0),Decimal(0))
+    total_cents = cost * Decimal(cents(unit_cost))
+    return '\n\n'.join(paragraphs) + '\n\n合计：' + money(total_cents) + '元'

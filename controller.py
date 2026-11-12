@@ -12,6 +12,7 @@ from models import MessageRecord, Analysis, cents, now, money
 from parser import BetParser, split_lottery_message
 from risk_engine import RiskEngine
 from batch_schedule import is_closed, finalized_on_time
+from rule_catalog import migrate_photo_defaults_for_new_period
 from recognition_policy import classify_fragment, ai_fragments, ai_candidate_validation
 from data_store import StaleRecordError
 
@@ -127,6 +128,10 @@ class Controller:
                     for play, rule in overrides.items():
                         if play in self.rules[lottery]:
                             self.rules[lottery][play].update(rule)
+            # Old settings can contain a full copy of the pre-upgrade price table.
+            # Upgrade those defaults for this NEW period only; saved periods and
+            # their bets/settlements are never rewritten by this path.
+            migrate_photo_defaults_for_new_period(self.rules)
             _migrate_position_rules(self.rules)
             self.settings['policy']['position_cost'] = 'combination'
             self.store.save_period_rules(period, self.rules, self.settings['policy'])
