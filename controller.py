@@ -1,4 +1,5 @@
 import sqlite3
+import os
 from copy import deepcopy
 from collections import Counter
 import hashlib
@@ -1060,7 +1061,11 @@ class Controller:
         added = []
         errors = []
         groups = group_lotteries(self.settings['wechat'])
-        for inbox_id, payload in self.store.inbox(groups)[:12]:
+        batched = os.environ.get('FC3D_INBOX_BATCH','1') == '1'
+        started = perf_counter()
+        for index, (inbox_id, payload) in enumerate(self.store.inbox(groups)[:64 if batched else 12]):
+            if batched and index and perf_counter()-started >= .025:
+                break
             lottery = groups.get(payload['group_id'])
             if not lottery:
                 # 未绑定群保留，用户绑定后仍可接着处理。
@@ -1092,6 +1097,15 @@ class Controller:
                 if '21:14已截止' in str(exc):
                     self.store.mark_inbox_rejected(inbox_id, str(exc))
                 errors.append(str(exc))
+        if groups:
+            placeholders = ','.join('?' for _ in groups)
+            counts = self.store.db.execute(
+                'SELECT count(*),coalesce(sum(processed=0),0),coalesce(sum(processed=1),0),'
+                'coalesce(sum(processed=2),0) FROM inbox WHERE group_id IN ('+placeholders+')',
+                list(groups)).fetchone()
+            self.inbox_progress = dict(zip(('persisted','pending','completed','rejected'),counts))
+        else:
+            self.inbox_progress = dict(persisted=0,pending=0,completed=0,rejected=0)
         return added, errors
 
 # V257-20261031-source-evidence-hotfix

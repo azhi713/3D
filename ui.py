@@ -1277,6 +1277,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         # Always calculate 1000 outcomes on the worker, including small lists;
         # a Tk callback must never do synchronous risk enumeration.
         self.copy_button.configure(state='disabled')
+        self._risk_record_version = records_version(self.store,self.controller.period)
         self._risk_next = (generation,inputs)
         self._start_risk_job()
         self.update_status()
@@ -2117,9 +2118,13 @@ class RiskApp(ShortcutMixin, tk.Tk):
         cutoff_label = ('截止：关（可测试）' if not cutoff_on else
                         ('已封盘' if is_frozen else '21:14截止：开'))
         notice = self._wechat_notice_error or self._wechat_notice_status
+        progress = getattr(self.controller,'inbox_progress',{})
+        queue_note = (f"    收件已存{progress['persisted']} · 待处理{progress['pending']}"
+                      f" · 业务完成{progress['completed']} · 界面版本{getattr(self,'_risk_applied_generation',0)}"
+                      if progress.get('persisted') else '')
         self.status.configure(text=f'微信：{self.wechat.status}    AI：{ai}    {cutoff_label}'
                               + ('    通知：' + notice[:100] if notice else '')
-                              + f'    更新：{now():%H:%M:%S}')
+                              + queue_note + f'    更新：{now():%H:%M:%S}')
 
     def toggle_wechat(self):
         if self.wechat.listening:
@@ -2870,7 +2875,15 @@ class RiskApp(ShortcutMixin, tk.Tk):
                     _,generation,snapshot,error = event
                     self._risk_running = False
                     if generation == self._risk_generation:
-                        self._apply_risk_snapshot(snapshot,error)
+                        from analysis_input_cache import records_version
+                        current_version = records_version(self.store,self.controller.period)
+                        if current_version is None or current_version != getattr(self,'_risk_record_version',None):
+                            self._risk_key = None
+                            dirty = True
+                        else:
+                            self._apply_risk_snapshot(snapshot,error)
+                            if not error:
+                                self._risk_applied_generation = generation
                     self._start_risk_job()
                 elif event[0] == 'test':
                     _, label, result = event
@@ -2901,6 +2914,13 @@ class RiskApp(ShortcutMixin, tk.Tk):
             for record in added:
                 self.queue_ai(record,refresh_ui=False)
             dirty = dirty or bool(added)
+            batched_inbox = os.environ.get('FC3D_INBOX_BATCH','1') == '1'
+            backlog = getattr(self.controller,'inbox_progress',{}).get('pending',0)
+            if added and batched_inbox:
+                # Invalidate old work immediately, even if presentation is deferred.
+                self._risk_generation += 1
+                self._risk_next = None
+                self._risk_key = None
             if errors:
                 self.wechat.last_error = errors[0]
                 self.wechat.status = '消息尚未处理：'+errors[0]
@@ -2911,13 +2931,22 @@ class RiskApp(ShortcutMixin, tk.Tk):
                     self.period.set(today)
                     dirty = True
                 self.last_day = today
-            if dirty:
+            pending_refresh = dirty or getattr(self,'_inbox_deferred_dirty',False)
+            publish_now = (not batched_inbox or not backlog or
+                           perf_counter()-getattr(self,'_inbox_last_refresh',0) >= .75)
+            if pending_refresh and publish_now:
+                self._inbox_deferred_dirty = False
                 self.refresh()
+                self._inbox_last_refresh = perf_counter()
             else:
+                self._inbox_deferred_dirty = pending_refresh
                 self.update_status()
         except (ValueError, OSError, sqlite3.Error) as exc:
             self.warning.configure(text='数据处理失败，原始消息仍保留：'+str(exc), fg=RED)
-        self._timer = self.after(200, self.pump)
+        fast = (os.environ.get('FC3D_INBOX_BATCH','1') == '1' and
+                getattr(self.controller,'inbox_progress',{}).get('pending',0) and
+                bool(locals().get('added')))
+        self._timer = self.after(10 if fast else 200, self.pump)
 
     def _wechat_notice_tick(self):
         if self._closing or self._wechat_notice_ledger is None:
