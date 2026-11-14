@@ -36,3 +36,24 @@ class OuterCompatibility(unittest.TestCase):
                 self.assertEqual(rec.raw_text,raw)
                 self.assertEqual(rec.source_original_text,raw)
             finally:store.close()
+
+    def test_explicit_multiple_with_customer_total(self):
+        from models import MessageRecord
+        with tempfile.TemporaryDirectory() as directory:
+            store=DataStore(Path(directory))
+            try:
+                ctrl=Controller(store);ctrl.activate_period('2026-11-15')
+                ctrl.settings['deadline']['enabled']=False
+                ctrl.settings['recognition_outer_compat']=True
+                for sep in (',','，','\n'):
+                    raw='福689直选1倍'+sep+'合计5元'
+                    rec=ctrl.add('福彩',raw)
+                    self.assertEqual(rec.computed_amount_yuan,2)
+                    self.assertEqual(rec.claimed_amount,5)
+                    self.assertIsNone(rec.received_amount)
+                    self.assertEqual(rec.parse_status,'verified_receipt_discrepancy')
+                    self.assertEqual(rec.raw_text,raw)
+                    ctrl.parse_record(rec)
+                    self.assertEqual(len(rec.bets),1)
+                    self.assertEqual(rec.bets[0].multiplier,1)
+            finally:store.close()
