@@ -123,6 +123,9 @@ def candidate_metrics(revenue_cents, payouts_cents, rows, unit_cost,
                     amount_cents(normal_prize), amount_cents(leopard_prize))
 
 
+from display_metric_cache import cached_metrics
+
+@cached_metrics
 def purchased_metrics(revenue_cents, payouts_cents, purchase):
     """An already bought plan uses its stored total cost and stored prize rules."""
     if purchase is None:
