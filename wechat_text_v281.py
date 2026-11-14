@@ -42,7 +42,9 @@ def split_sender(text,sender='',group_id='',trusted_database=False):
     elif (not current or current.isdigit()) and trusted_database and (WXID.fullmatch(prefix) or CUSTOM.fullmatch(prefix)):
         # Only the native database callback can opt into this transport grammar.
         # A valid betting body corroborates a non-wxid legacy account name.
-        if re.search(r'(?<![0-9])[0-9]{1,9}(?![0-9])',body) and re.search(r'注|倍|直选|组六|组三|组选|双飞|定位|复试|复式|跨度|和值|独|对子|元|米|块',body):
+        if WXID.fullmatch(prefix):
+            proof='native_group_wxid_header'
+        elif re.search(r'(?<![0-9])[0-9]{1,9}(?![0-9])',body) and re.search(r'注|倍|直选|组六|组三|组选|双飞|定位|复试|复式|跨度|和值|独|对子|元|米|块',body):
             proof='native_group_header_and_betting_body'
     if not proof:return CleanMessage(original,current,original)
     return CleanMessage(body.lstrip('\r\n'),prefix,original,prefix,proof)
