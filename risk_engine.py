@@ -65,6 +65,7 @@ class RiskEngine:
     def __init__(self, rules=None, policy=None):
         self.rules = rules or RULES_BY_LOTTERY
         self.policy = policy or {}
+        self.plan_warning = ''
 
     def payout_for(self, lottery, bet, result):
         if result not in RESULTS:
@@ -101,6 +102,7 @@ class RiskEngine:
 
     def calculate(self, lottery, bets, threshold, external_direct_prize, revenue=None,
                   metric='payout', hedge_cost=None, unit_cost=2, leopard_direct_prize=1600):
+        self.plan_warning = ''
         threshold_cents = cents(threshold)
         reward = cents(external_direct_prize)
         leopard_reward = cents(leopard_direct_prize)
@@ -129,18 +131,23 @@ class RiskEngine:
         if hedge_cost:
             rewards = [leopard_reward if len(set(row.number)) == 1 else reward for row in rows]
             if sum((Fraction(unit, r) for r in rewards), Fraction()) >= 1:
-                raise ValueError('风险号码过多，计入全部补单成本后无法生成有效覆盖方案')
-            multipliers = [r.plan_multiplier for r in rows]
-            for _ in range(10000):
-                total_cost = sum(multipliers) * unit
-                updated = [max(0, (int(round(row.net_loss*100))+total_cost+row_reward-1)//row_reward) for row,row_reward in zip(rows,rewards)]
-                if updated == multipliers:
-                    break
-                multipliers = updated
+                self.plan_warning = '达到阈值的号码过多，计入全部补单成本后无法形成有限倍数的整体补单方案；风险与收单统计仍有效'
             else:
-                raise ValueError('补单成本计算未收敛，请调整阈值')
-            for row, multiplier in zip(rows, multipliers):
-                row.plan_multiplier = multiplier
+                multipliers = [r.plan_multiplier for r in rows]
+                for _ in range(1000):
+                    total_cost = sum(multipliers) * unit
+                    updated = [max(0, (int(round(row.net_loss*100))+total_cost+row_reward-1)//row_reward) for row,row_reward in zip(rows,rewards)]
+                    if updated == multipliers:
+                        break
+                    multipliers = updated
+                else:
+                    self.plan_warning = '全部补单成本计算未收敛；风险与收单统计仍有效，暂不生成自动补单倍数'
+                if not self.plan_warning:
+                    for row, multiplier in zip(rows, multipliers):
+                        row.plan_multiplier = multiplier
+            if self.plan_warning:
+                for row in rows:
+                    row.plan_multiplier = 0
         rows.sort(key=lambda row: (-row.net_loss, row.number))
         return total_principal/100, rows, dict(zip(RESULTS, (p/100 for p in payouts)))
 

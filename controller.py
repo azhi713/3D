@@ -15,6 +15,7 @@ from batch_schedule import is_closed, finalized_on_time
 from rule_catalog import migrate_photo_defaults_for_new_period
 from recognition_policy import classify_fragment, ai_fragments, ai_candidate_validation
 from data_store import StaleRecordError
+from wechat_groups_v288 import bound_groups, normalize_bindings, group_lotteries
 
 
 def _migrate_old_fushi_rules(rules):
@@ -743,10 +744,11 @@ class Controller:
                    + sum(cents(b.principal) for r in partial for b in r.bets))
         period_rules = self.store.load_period_rules(period) or {'rules':self.rules,'policy':self.settings['policy']}
         engine = RiskEngine(period_rules['rules'], period_rules['policy'])
+        lottery_filter = self.settings.get('risk_filters', {}).get(lottery, {})
         principal, risks, _ = engine.calculate(
-            lottery, bets, self.settings['risk_threshold'],
+            lottery, bets, lottery_filter.get('threshold', self.settings['risk_threshold']),
             self.settings['external_direct_prize'][lottery], revenue/100,
-            self.settings['threshold_metric'], self.settings['include_hedge_cost'],
+            lottery_filter.get('metric', self.settings['threshold_metric']), self.settings['include_hedge_cost'],
             self.settings['direct_unit_cost'][lottery], self.settings['external_leopard_direct_prize'][lottery])
         unresolved = [
             {'record_id':r.record_id, 'status':r.status, 'parse_status':r.parse_status,
@@ -923,9 +925,10 @@ class Controller:
         revenue = (sum(cents(r.received_amount) if r.received_amount is not None else
                        sum(cents(b.principal) for b in r.bets) for r in valid)
                    + sum(cents(b.principal) for r in partial for b in r.bets))
+        lottery_filter = self.settings.get('risk_filters', {}).get(lottery, {})
         args = (
-            lottery, bets, self.settings['risk_threshold'], self.settings['external_direct_prize'][lottery],
-            revenue/100, self.settings['threshold_metric'], self.settings['include_hedge_cost'],
+            lottery, bets, lottery_filter.get('threshold', self.settings['risk_threshold']), self.settings['external_direct_prize'][lottery],
+            revenue/100, lottery_filter.get('metric', self.settings['threshold_metric']), self.settings['include_hedge_cost'],
             self.settings['direct_unit_cost'][lottery], self.settings['external_leopard_direct_prize'][lottery])
         return deepcopy((self.rules,self.settings['policy'],args,revenue,
                          len(records)-len(valid)+sum(any(b.settlement_rule_pending for b in r.bets) for r in valid),
@@ -934,9 +937,10 @@ class Controller:
     @staticmethod
     def calculate_analysis(inputs):
         rules,policy,args,revenue,pending,unconfirmed=inputs
-        principal,risks,payouts=RiskEngine(rules,policy).calculate(*args)
+        engine = RiskEngine(rules, policy)
+        principal,risks,payouts=engine.calculate(*args)
         return Analysis(cents(principal), revenue, risks, payouts,
-                        pending,unconfirmed)
+                        pending,unconfirmed,engine.plan_warning)
 
     def analysis(self, lottery):
         return self.calculate_analysis(self.analysis_inputs(lottery))
@@ -975,8 +979,13 @@ class Controller:
             raise ValueError('规则选项无效')
         settings['policy']['position_cost'] = 'combination'
         _migrate_position_rules(rules)
-        if settings['wechat']['fc_group'] and settings['wechat']['fc_group'] == settings['wechat']['tc_group']:
-            raise ValueError('福彩和体彩不能绑定同一个群')
+        for lottery in LOTTERIES:
+            filt = settings.get('risk_filters', {}).get(lottery)
+            if filt is not None:
+                if not isinstance(filt, dict) or filt.get('metric') not in ('payout', 'net_loss'):
+                    raise ValueError(lottery+'风险筛选方式无效')
+                cents(filt.get('threshold'))
+        settings['wechat'] = normalize_bindings(settings['wechat'])
         for key in ('bridge_port', 'wcf_port'):
             if not 1 <= int(settings['wechat'][key]) <= 65535:
                 raise ValueError('连接端口须为1～65535')
@@ -1015,7 +1024,7 @@ class Controller:
     def drain_inbox(self):
         added = []
         errors = []
-        groups = {self.settings['wechat'].get('fc_group'): '福彩', self.settings['wechat'].get('tc_group'): '体彩'}
+        groups = group_lotteries(self.settings['wechat'])
         for inbox_id, payload in self.store.inbox(groups)[:12]:
             lottery = groups.get(payload['group_id'])
             if not lottery:

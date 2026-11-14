@@ -442,6 +442,9 @@ class DashboardV280Mixin:
             for badge in self._v280_badges.values():badge.configure(text='')
             for key,label in self.cards.items():
                 label.configure(text='最大亏损 —' if key=='loss' else '最大盈利 —' if key=='best_profit' else '—')
+            revenue = getattr(self, '_current_revenue_cents', None)
+            if revenue is not None:
+                self.cards['income'].configure(text=format_yuan(revenue)+'元', fg=INK)
             self._update_optimizer_comparison()
             return
         try:

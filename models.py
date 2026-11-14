@@ -106,3 +106,4 @@ class Analysis:
     payouts: dict
     pending: int
     unconfirmed_receipts: int
+    plan_warning: str = ''

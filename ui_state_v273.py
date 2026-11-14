@@ -24,6 +24,7 @@ class UIStateV273:
         # cleared the unified target and must not resurrect a legacy value.
         self.data.setdefault('target_goal_yuan', None)
         self.data.setdefault('records_split', {})
+        self.data.setdefault('risk_search_by_lottery', {})
         # V281-THRESHOLD-STEP-SETTING: include in persisted-key allowlist.
         self.data.setdefault('threshold_step_yuan', '1000')
         # V280-EIGHT-CARDS-FOUR-PLAN-DASHBOARD: loaded JSON may contain these keys.
@@ -47,6 +48,8 @@ class UIStateV273:
             self.data['purchased_hedge_modes'] = {}
         if not isinstance(self.data.get('normal_window_geometry'), str):
             self.data['normal_window_geometry'] = ''
+        if not isinstance(self.data.get('risk_search_by_lottery'), dict):
+            self.data['risk_search_by_lottery'] = {}
 
     # V2734: 实际已买补单与实时风险模拟分开保存。
     def get_actual_hedge(self, lottery, period):

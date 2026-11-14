@@ -19,6 +19,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from models import now
 from data_store import DataStore
+from wechat_groups_v288 import bound_groups
 
 
 class WeChatService:
@@ -103,11 +104,12 @@ class WeChatService:
             name = self.groups.get(group_id, group_id)
         return self.friendly_group_name(group_id, name)
 
-    def _refresh_self_info(self):
-        if self.db_client is None or not hasattr(self.db_client, 'get_self_info'):
+    def _refresh_self_info(self, db=None):
+        db = self.db_client if db is None else db
+        if db is None or not hasattr(db, 'get_self_info'):
             return
         try:
-            info = self.db_client.get_self_info() or {}
+            info = db.get_self_info() or {}
         except Exception:
             return
         if isinstance(info, dict):
@@ -175,22 +177,23 @@ class WeChatService:
             # 测试桩或旧兼容实现可能不接收这些关键字。
             return db_factory()
 
-    def _refresh_wechat4_groups(self):
-        sessions = self.db_client.get_sessions(limit=int(self.config.get('session_scan_limit', 1000))) or []
+    def _refresh_wechat4_groups(self, db=None):
+        db = self.db_client if db is None else db
+        sessions = db.get_sessions(limit=int(self.config.get('session_scan_limit', 1000))) or []
         discovered = {}
         for item in sessions:
             group_id = str(item.get('username', '')).strip()
             if not group_id.endswith('@chatroom'):
                 continue
             try:
-                name = self.db_client.get_nickname(group_id) or item.get('nickname') or item.get('remark') or group_id
+                name = db.get_nickname(group_id) or item.get('nickname') or item.get('remark') or group_id
             except Exception:
                 name = item.get('nickname') or item.get('remark') or group_id
             discovered[group_id] = self.friendly_group_name(group_id, name)
         # 某些账号session表没有完整列出群，补读含消息会话。
-        if hasattr(self.db_client, 'list_message_chats'):
+        if hasattr(db, 'list_message_chats'):
             try:
-                for item in self.db_client.list_message_chats() or []:
+                for item in db.list_message_chats() or []:
                     group_id = str(item.get('username') or item.get('user') or item.get('wxid') or '').strip()
                     if not group_id.endswith('@chatroom') or group_id in discovered:
                         continue
@@ -291,11 +294,8 @@ class WeChatService:
                 self.db_client = self._build_wechat4_db(db_factory)
                 self._refresh_self_info()
                 discovered = self._refresh_wechat4_groups()
-                bound = []
-                for key in ('fc_group', 'tc_group'):
-                    group_id = str(self.config.get(key, '')).strip()
-                    if group_id and group_id not in bound:
-                        bound.append(group_id)
+                bound = list(dict.fromkeys(bound_groups(self.config, '福彩') +
+                                           bound_groups(self.config, '体彩')))
 
                 if not bound:
                     self.connected = True
@@ -440,6 +440,9 @@ class WeChatService:
                         continue
                     if not msg.from_group() or not msg.is_text():
                         continue
+                    if msg.roomid not in (bound_groups(self.config, '福彩') +
+                                          bound_groups(self.config, '体彩')):
+                        continue
                     is_self = False
                     try:
                         is_self = bool(msg.from_self())
@@ -476,20 +479,17 @@ class WeChatService:
         """手动读取绑定群历史消息。实时监听永远不会隐式调用本方法。"""
         if self.config.get('backend', 'wechat4') != 'wechat4':
             raise RuntimeError('读取历史消息目前仅支持微信4.x本地监听')
-        group_ids = [str(g).strip() for g in group_ids if str(g).strip()]
+        group_ids = list(dict.fromkeys(str(g).strip() for g in group_ids if str(g).strip()))
         if not group_ids:
             raise ValueError('请先绑定要读取的微信群')
-        db = self.db_client
-        temporary = db is None
-        if temporary:
-            db_factory, _ = self._wechat4_imports()
-            db = self._build_wechat4_db(db_factory)
-        old = self.db_client
-        self.db_client = db
-        self._refresh_self_info()
+        # History work uses an independent DB handle.  Never mutate the live
+        # listener's handle from a background history worker.
+        db_factory, _ = self._wechat4_imports()
+        db = self._build_wechat4_db(db_factory)
+        self._refresh_self_info(db)
         try:
             try:
-                self._refresh_wechat4_groups()
+                self._refresh_wechat4_groups(db)
             except Exception:
                 pass
             today = now().date()
@@ -509,6 +509,8 @@ class WeChatService:
                             received = datetime.fromisoformat(self._message_time(msg.get('create_time') or msg.get('timestamp')))
                             if received.date() == today:
                                 messages.append((received, gid, msg))
+                                if len(messages) > 100000:
+                                    raise RuntimeError('今日消息超过10万条，为保护内存已停止整日读取；请改用最近100条或缩小群范围')
                             elif received.date() < today:
                                 saw_older = True
                         if len(rows) < 500 or saw_older:
@@ -536,7 +538,10 @@ class WeChatService:
                     duplicate += 1
             return {'inserted': inserted, 'duplicate': duplicate, 'ignored': ignored}
         finally:
-            self.db_client = old
+            try:
+                db.close()
+            except (AttributeError, TypeError):
+                pass
 
     def group_list(self):
         with self.lock:

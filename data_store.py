@@ -176,15 +176,24 @@ class DataStore:
     def load_settings(self):
         settings = deepcopy(DEFAULT_SETTINGS)
         row = self.db.execute('SELECT payload FROM settings WHERE id=1').fetchone()
+        loaded = None
         if row:
-            merge(settings, json.loads(row[0]))
+            loaded = json.loads(row[0])
+            merge(settings, loaded)
         else:
             old = self.data_dir / 'settings.json'
             if old.exists():
                 saved = json.loads(old.read_text(encoding='utf-8-sig'))
+                loaded = saved
                 merge(settings, saved)
                 settings['threshold_metric'] = 'payout'
                 settings['plan_total_mode'] = 'money'
+        # Missing keys in pre-V288 settings mean "use the old single-group
+        # binding", not "the user deliberately cleared every group".
+        saved_wechat = (loaded or {}).get('wechat', {})
+        for plural in ('fc_groups', 'tc_groups'):
+            if plural not in saved_wechat:
+                settings['wechat'].pop(plural, None)
         # 仅更新程序自带的旧版默认提示词；用户自行编辑的提示词绝不覆盖。
         saved_prompt = settings.get('ai', {}).get('prompt') or ''
         legacy_default_hashes = {

@@ -24,6 +24,8 @@ from ai_service import AIService, AIError, effective_timeout, _redact
 from ai_diagnostics import AIDiagnostics, SAMPLE as AI_DIAG_SAMPLE
 from parser import BetParser
 from wechat_service import WeChatService
+from wechat_groups_v288 import MAX_GROUPS_PER_LOTTERY, bound_groups
+from wechat_notice_v288 import NoticeLedger, due_send, due_reminder, send_notice
 from risk_engine import (plan_text, adjust_plan_rows,
                          plan_financials, calculate_total_profit_cents)
 from ui_state_v273 import UIStateV273, visible_periods
@@ -445,6 +447,12 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.period = tk.StringVar(value=self.controller.period)
         self.threshold = tk.StringVar(value=str(self.controller.settings['risk_threshold']))
         self.metric = tk.StringVar(value='总赔付' if self.controller.settings['threshold_metric'] == 'payout' else '净亏损')
+        self._filter_lottery = None
+        self._risk_search_by_lottery = {
+            lottery: str(self._ui_state.data.get('risk_search_by_lottery', {}).get(lottery, ''))
+            for lottery in LOTTERIES
+        }
+        self._switch_lottery_filter('福彩', persist_previous=False)
         self.receipt = tk.StringVar()
         self.draw_number = tk.StringVar()
         self.hedge_confirmed = tk.BooleanVar(value=False)
@@ -470,6 +478,17 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.pool = PriorityExecutor(max_workers=max(1,min(32,int(self.controller.settings['ai'].get('max_concurrency',16)))), thread_name_prefix='bet-ai')
         self.risk_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='risk-calc')
         self.optimizer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='hedge-opt')
+        # One serial sender protects the desktop WeChat window from concurrent
+        # GUI actions, regardless of how many groups are bound.
+        self.wechat_send_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='wechat-outbound')
+        self.wechat_history_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='wechat-history')
+        self._wechat_notice_status = ''
+        self._wechat_notice_ledger = None
+        self._wechat_notice_error = ''
+        try:
+            self._wechat_notice_ledger = NoticeLedger(self.store.data_dir / 'wechat_notice_v288.json')
+        except (OSError, ValueError, TypeError) as exc:
+            self._wechat_notice_error = '历史发送记录无法读取，自动群发已暂停：' + str(exc)[:140]
         self._risk_generation = 0
         self._risk_key = None
         self._risk_running = False
@@ -823,7 +842,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
             text='点击号码查看命中明细。原始投注倍数与建议补单倍数分别展示。',
             foreground=MUTED)
         self.risk_info.pack(side='left', fill='x', expand=True)
-        self.risk_search = tk.StringVar(value='')
+        self.risk_search = tk.StringVar(value=self._risk_search_by_lottery.get('福彩', ''))
         risk_search_entry = ttk.Entry(risk_header, textvariable=self.risk_search, width=13)
         risk_search_entry.pack(side='right')
         ttk.Label(risk_header, text='搜索号码').pack(side='right', padx=(3, 6))
@@ -973,12 +992,45 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self.after_cancel(self._threshold_timer)
         self._threshold_timer = self.after(300, self.apply_filter)
 
+    def _switch_lottery_filter(self, lottery, persist_previous=True):
+        """Keep risk threshold, metric and search independent for each lottery."""
+        previous = getattr(self, '_filter_lottery', None)
+        if previous == lottery:
+            return
+        if previous in LOTTERIES and persist_previous:
+            if self._threshold_timer is not None:
+                self.after_cancel(self._threshold_timer)
+                self._threshold_timer = None
+            if hasattr(self, 'risk_search'):
+                self._risk_search_by_lottery[previous] = self.risk_search.get().strip()
+                self._ui_state.data['risk_search_by_lottery'] = dict(self._risk_search_by_lottery)
+                self._ui_state.save()
+            try:
+                threshold = cents(self.threshold.get()) / 100
+                self.controller.settings.setdefault('risk_filters', {})[previous] = {
+                    'threshold': threshold,
+                    'metric': 'payout' if self.metric.get() == '总赔付' else 'net_loss',
+                }
+                self.store.save_settings(self.controller.settings)
+            except (ValueError, OSError, sqlite3.Error):
+                pass  # Invalid half-typed input cannot damage saved filters.
+        self._filter_lottery = lottery
+        config = self.controller.settings.get('risk_filters', {}).get(lottery, {})
+        threshold = config.get('threshold', self.controller.settings['risk_threshold'])
+        metric = config.get('metric', self.controller.settings['threshold_metric'])
+        self.threshold.set(str(threshold))
+        self.metric.set('总赔付' if metric == 'payout' else '净亏损')
+        if hasattr(self, 'risk_search'):
+            self.risk_search.set(self._risk_search_by_lottery.get(lottery, ''))
+
     def apply_filter(self):
         self._threshold_timer = None
         try:
             value = cents(self.threshold.get())/100
             self.controller.settings['risk_threshold'] = value
             self.controller.settings['threshold_metric'] = 'payout' if self.metric.get() == '总赔付' else 'net_loss'
+            self.controller.settings.setdefault('risk_filters', {})[self.lottery.get()] = {
+                'threshold': value, 'metric': self.controller.settings['threshold_metric']}
             self.store.save_settings(self.controller.settings)
             self.error = ''
             self.refresh()
@@ -1149,6 +1201,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.refresh()
 
     def refresh(self):
+        self._switch_lottery_filter(self.lottery.get())
         self._sync_draw_context()
         lottery = self.lottery.get()
         cache_key = (self.store.change_serial,self.controller.period,lottery)
@@ -1187,6 +1240,9 @@ class RiskApp(ShortcutMixin, tk.Tk):
         periods = self._visible_periods()
         self.period_combo.configure(values=periods)
         inputs = self.controller.analysis_inputs(lottery,records)
+        # Income is a verified-record aggregate, independent of whether any
+        # threshold/hedge-plan calculation later succeeds.
+        self._current_revenue_cents = int(inputs[3])
         # Only financial inputs affect the 1000-outcome calculation; queue/status changes reuse it.
         # V277: changing external pricing invalidates optimizer candidates.
         cfg = self.controller.settings
@@ -1248,6 +1304,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
             else:
                 self._simulate_risk_draw()
             warnings = []
+            if self.snapshot.plan_warning:
+                warnings.append(self.snapshot.plan_warning)
             if self.snapshot.pending:
                 warnings.append(f'有{self.snapshot.pending}条待处理；已验证的部分投注已计入，未解决片段尚未计入，当前结果不完整。')
             batch = self.store.load_batch(self.controller.period, lottery)
@@ -2033,14 +2091,17 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self.pending_label.configure(text=f'待处理：{pending}', fg=ORANGE if pending else '#167647')
         if hasattr(self, 'group_label'):
             wc = self.controller.settings.get('wechat', {})
-            fc = self.wechat.group_display(wc.get('fc_group',''))
-            tc = self.wechat.group_display(wc.get('tc_group',''))
-            self.group_label.configure(text=f'福彩群：{fc}    体彩群：{tc}')
+            fc = bound_groups(wc, '福彩')
+            tc = bound_groups(wc, '体彩')
+            self.group_label.configure(text=f'福彩：已绑定{len(fc)}群    体彩：已绑定{len(tc)}群')
         cutoff_on = self.controller.deadline_enabled()
         is_frozen = self.store.load_batch(self.controller.period, self.lottery.get()) if cutoff_on else None
         cutoff_label = ('截止：关（可测试）' if not cutoff_on else
                         ('已封盘' if is_frozen else '21:14截止：开'))
-        self.status.configure(text=f'微信：{self.wechat.status}    AI：{ai}    {cutoff_label}    更新：{now():%H:%M:%S}')
+        notice = self._wechat_notice_error or self._wechat_notice_status
+        self.status.configure(text=f'微信：{self.wechat.status}    AI：{ai}    {cutoff_label}'
+                              + ('    通知：' + notice[:100] if notice else '')
+                              + f'    更新：{now():%H:%M:%S}')
 
     def toggle_wechat(self):
         if self.wechat.listening:
@@ -2075,7 +2136,9 @@ class RiskApp(ShortcutMixin, tk.Tk):
 
     def history_dialog(self):
         wc = self.controller.settings.get('wechat', {})
-        if not wc.get('fc_group') and not wc.get('tc_group'):
+        fc_groups = bound_groups(wc, '福彩')
+        tc_groups = bound_groups(wc, '体彩')
+        if not fc_groups and not tc_groups:
             self.fail(ValueError('请先在设置中绑定福彩群或体彩群'))
             return
         win = tk.Toplevel(self)
@@ -2088,7 +2151,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         ttk.Label(win, text='正常微信监听只接收开启后的新消息，不会自动回放历史。', foreground=MUTED).pack(anchor='w', padx=18, pady=(0,12))
         row = ttk.Frame(win); row.pack(fill='x', padx=18, pady=6)
         ttk.Label(row, text='读取群聊', width=12).pack(side='left')
-        ttk.Combobox(row, textvariable=target, values=['当前彩种','福彩群','体彩群','两个群'], state='readonly').pack(side='left', fill='x', expand=True)
+        ttk.Combobox(row, textvariable=target, values=['当前彩种','福彩群','体彩群','全部绑定群'], state='readonly').pack(side='left', fill='x', expand=True)
         row = ttk.Frame(win); row.pack(fill='x', padx=18, pady=6)
         ttk.Label(row, text='读取范围', width=12).pack(side='left')
         ttk.Combobox(row, textvariable=scope, values=['今天消息','最近50条','最近100条'], state='readonly').pack(side='left', fill='x', expand=True)
@@ -2096,10 +2159,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
         def run():
             ids=[]
             if target.get()=='当前彩种':
-                ids=[wc.get('fc_group') if self.lottery.get()=='福彩' else wc.get('tc_group')]
-            elif target.get()=='福彩群': ids=[wc.get('fc_group')]
-            elif target.get()=='体彩群': ids=[wc.get('tc_group')]
-            else: ids=[wc.get('fc_group'),wc.get('tc_group')]
+                ids=fc_groups if self.lottery.get()=='福彩' else tc_groups
+            elif target.get()=='福彩群': ids=fc_groups
+            elif target.get()=='体彩群': ids=tc_groups
+            else: ids=fc_groups+tc_groups
             ids=[x for x in ids if x]
             if not ids:
                 self.fail(ValueError('所选彩种还没有绑定微信群'))
@@ -2117,7 +2180,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
                     self.events.put(('history_done', result))
                 except Exception as exc:
                     self.events.put(('history_error', str(exc)))
-            self.pool.submit(task)
+            self.wechat_history_pool.submit(task)
         buttons=ttk.Frame(win); buttons.pack(fill='x', padx=18, pady=18)
         ttk.Button(buttons,text='取消',command=win.destroy).pack(side='right')
         ttk.Button(buttons,text='开始读取',style='Accent.TButton',command=run).pack(side='right',padx=(0,8))
@@ -2686,12 +2749,22 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self._timer=None
         dirty = False
         try:
+            self._wechat_notice_tick()
             completed = self.controller.tick_deadline()
             dirty = bool(completed)
             for _ in range(30):
                 if self.events.empty():
                     break
                 event = self.events.get_nowait()
+                if event[0] == 'wechat_stop_send_result':
+                    _, day, lottery, gid, status, detail = event
+                    if self._wechat_notice_ledger is not None:
+                        try:
+                            self._wechat_notice_ledger.finish(day, lottery, gid, status, detail, now())
+                        except OSError as exc:
+                            self._wechat_notice_error = '发送结果保存失败，请人工核对：' + str(exc)[:120]
+                    self._wechat_notice_status = f'{lottery}停单消息：{self.wechat.group_display(gid)} · {"已验证发送" if status == "confirmed" else "请人工核对：" + detail[:85]}'
+                    continue
                 if event[0] == 'optimizer_ready':
                     _, generation, context, result, error = event
                     self._apply_optimizer_ready(generation, context, result, error)
@@ -2827,6 +2900,66 @@ class RiskApp(ShortcutMixin, tk.Tk):
         except (ValueError, OSError, sqlite3.Error) as exc:
             self.warning.configure(text='数据处理失败，原始消息仍保留：'+str(exc), fg=RED)
         self._timer = self.after(200, self.pump)
+
+    def _wechat_notice_tick(self):
+        if self._closing or self._wechat_notice_ledger is None:
+            return
+        clock = now()
+        wc = self.controller.settings.get('wechat', {})
+        day = clock.date().isoformat()
+        for lottery, reminder in due_reminder(clock, wc):
+            if self._wechat_notice_ledger.reserve(day, lottery, '__reminder__', clock):
+                self._wechat_notice_remind(reminder)
+                self._wechat_notice_ledger.finish(day, lottery, '__reminder__', 'confirmed', '已触发提醒', clock)
+        for lottery, group_id, message in due_send(clock, wc):
+            if self._wechat_notice_ledger.reserve(day, lottery, group_id, clock):
+                name = self.wechat.group_display(group_id)
+                # Display names are not reliable identifiers when duplicated.
+                duplicates = [gid for gid, label in self.wechat.group_list()
+                              if label == name and gid != group_id]
+                if duplicates:
+                    self.events.put(('wechat_stop_send_result', day, lottery, group_id,
+                                     'failed', '存在同名群，无法安全定位，请人工发送'))
+                    continue
+                backend = str(wc.get('backend', 'wechat4'))
+                self.wechat_send_pool.submit(self._wechat_notice_worker,
+                                             day, lottery, group_id, name, message, backend)
+
+    def _wechat_notice_worker(self, day, lottery, group_id, name, message, backend):
+        try:
+            if self._closing:
+                raise RuntimeError('程序正在关闭，未发送')
+            client = self.wechat.client
+            sender = getattr(client, 'send_text', None) if backend == 'wcf' else None
+            status, detail = send_notice(backend, group_id, name, message, wcf_sender=sender)
+        except Exception as exc:
+            status, detail = 'unknown', str(exc)[:160]
+        self.events.put(('wechat_stop_send_result', day, lottery, group_id, status, detail))
+
+    def _wechat_notice_remind(self, content):
+        foreground = self.focus_displayof() is not None
+        if foreground:
+            self._wechat_notice_status = '⏰ ' + content
+            try:
+                self.bell()
+            except tk.TclError:
+                pass
+            return
+        self.deiconify()
+        self.lift()
+        try:
+            self.attributes('-topmost', True)
+            self.after(900, lambda: self.attributes('-topmost', False) if not self._closing else None)
+        except tk.TclError:
+            pass
+        notice = tk.Toplevel(self)
+        notice.title('提前收单提醒')
+        notice.transient(self)
+        notice.resizable(False, False)
+        ttk.Label(notice, text=content, padding=20,
+                  font=('Microsoft YaHei UI', 13, 'bold')).pack()
+        ttk.Button(notice, text='知道了', command=notice.destroy).pack(pady=(0, 16))
+        notice.after(15000, lambda: notice.destroy() if notice.winfo_exists() else None)
 
     # V283: independent, recoverable width for the manual-entry/records split.
     def _records_split_target(self, width):
@@ -3606,85 +3739,99 @@ class RiskApp(ShortcutMixin, tk.Tk):
         entry(wechat_page, '本机接收端口', settings['wechat']['bridge_port'], 'bridge_port')
         entry(wechat_page, 'WCF采集地址', settings['wechat']['wcf_host'], 'wcf_host')
         entry(wechat_page, 'WCF采集端口', settings['wechat']['wcf_port'], 'wcf_port')
-        group_ids = {key: tk.StringVar(value=settings['wechat'].get(key,'')) for key in ('fc_group','tc_group')}
+        group_bindings = {lottery: bound_groups(settings['wechat'], lottery) for lottery in LOTTERIES}
         group_displays = {}
-        for lottery, key in [('福彩','fc_group'), ('体彩','tc_group')]:
+        for lottery in LOTTERIES:
             row = ttk.Frame(wechat_page)
             row.pack(fill='x', pady=5)
             ttk.Label(row, text=lottery+'群', width=23).pack(side='left')
-            display_var = tk.StringVar(value=self.wechat.group_display(group_ids[key].get()))
-            group_displays[key] = display_var
+            display_var = tk.StringVar()
+            group_displays[lottery] = display_var
+            def summary(lot=lottery, text=display_var):
+                names = [self.wechat.group_display(gid) for gid in group_bindings[lot]]
+                text.set(f'已绑定{len(names)}群 / 最多{MAX_GROUPS_PER_LOTTERY}群：' + ('、'.join(names[:3]) + ('…' if len(names) > 3 else '') if names else '未绑定'))
+            summary()
             ttk.Entry(row, textvariable=display_var, state='readonly').pack(side='left', fill='x', expand=True)
-            def select_group(var=group_ids[key], display=display_var):
-                groups = self.wechat.group_list()
-                if not groups:
-                    self.fail(ValueError('尚未获取群列表。请先回主页面开启微信监听，等待状态显示已读取群列表，再回来选择聊天群。'))
-                    return
+
+            def manage_groups(lot=lottery, on_change=summary):
+                known = self.wechat.group_list()
                 chooser = tk.Toplevel(win)
-                chooser.title('选择聊天群')
-                chooser.geometry('620x460')
-                chooser.minsize(500, 360)
+                chooser.title(lot+' · 管理绑定群')
+                chooser.geometry('760x515')
+                chooser.minsize(630, 420)
                 chooser.transient(win)
-
-                search_row = ttk.Frame(chooser, padding=(12, 12, 12, 6))
+                selected = list(group_bindings[lot])
+                search = tk.StringVar()
+                search_row = ttk.Frame(chooser, padding=12)
                 search_row.pack(fill='x')
-                ttk.Label(search_row, text='搜索群聊').pack(side='left')
-                search_var = tk.StringVar()
-                search_entry = ttk.Entry(search_row, textvariable=search_var)
-                search_entry.pack(side='left', fill='x', expand=True, padx=(10, 0))
-
-                result_label = ttk.Label(chooser, text='', foreground=MUTED)
-                result_label.pack(fill='x', padx=12, pady=(0, 4))
-
-                list_frame = ttk.Frame(chooser)
-                list_frame.pack(fill='both', expand=True, padx=12, pady=(0, 8))
-                listing = tk.Listbox(list_frame, activestyle='dotbox')
-                scroll = ttk.Scrollbar(list_frame, orient='vertical', command=listing.yview)
-                listing.configure(yscrollcommand=scroll.set)
-                listing.pack(side='left', fill='both', expand=True)
-                scroll.pack(side='right', fill='y')
-
-                visible_groups = []
-
-                def refresh_group_list(*args):
-                    keyword = search_var.get().strip().lower()
-                    visible_groups.clear()
-                    listing.delete(0, 'end')
-                    for group_id, name in groups:
-                        haystack = f'{name} {group_id}'.lower()
-                        if keyword and keyword not in haystack:
+                ttk.Label(search_row, text='搜索群聊（左侧选择后添加，右侧选择后移除）').pack(side='left')
+                ttk.Entry(search_row, textvariable=search).pack(side='right', fill='x', expand=True, padx=(8, 0))
+                body = ttk.Frame(chooser, padding=(12, 0, 12, 8))
+                body.pack(fill='both', expand=True)
+                body.columnconfigure(0, weight=1); body.columnconfigure(2, weight=1)
+                body.rowconfigure(1, weight=1)
+                ttk.Label(body, text='微信已发现的群').grid(row=0, column=0, sticky='w')
+                count_label = ttk.Label(body, text='当前绑定')
+                count_label.grid(row=0, column=2, sticky='w')
+                available = tk.Listbox(body, selectmode='extended', exportselection=False)
+                current = tk.Listbox(body, selectmode='extended', exportselection=False)
+                available.grid(row=1, column=0, sticky='nsew')
+                current.grid(row=1, column=2, sticky='nsew')
+                actions = ttk.Frame(body)
+                actions.grid(row=1, column=1, padx=8)
+                visible = []
+                def refresh_choices(*_):
+                    visible.clear(); available.delete(0, 'end')
+                    keyword = search.get().strip().casefold()
+                    for gid, name in known:
+                        if keyword and keyword not in (gid+' '+name).casefold():
                             continue
-                        visible_groups.append((group_id, name))
-                        listing.insert('end', self.wechat.friendly_group_name(group_id, name))
-                    result_label.configure(text=f'找到 {len(visible_groups)} 个群聊')
-                    if visible_groups:
-                        listing.selection_clear(0, 'end')
-                        listing.selection_set(0)
-                        listing.activate(0)
-
-                def choose(event=None):
-                    selected = listing.curselection()
-                    if not selected or not visible_groups:
-                        return
-                    gid, gname = visible_groups[selected[0]]
-                    var.set(gid)
-                    display.set(self.wechat.friendly_group_name(gid, gname))
+                        visible.append(gid)
+                        available.insert('end', self.wechat.friendly_group_name(gid, name))
+                    current.delete(0, 'end')
+                    for gid in selected:
+                        current.insert('end', self.wechat.group_display(gid))
+                    count_label.configure(text=f'已选 {len(selected)} / {MAX_GROUPS_PER_LOTTERY} 群')
+                def add_selected():
+                    blocked = set(group_bindings['体彩' if lot == '福彩' else '福彩'])
+                    for index in available.curselection():
+                        gid = visible[index]
+                        if gid in blocked:
+                            messagebox.showwarning('绑定冲突', '此群已经绑定到另一彩种，不可重复绑定。', parent=chooser)
+                            return
+                        if gid not in selected:
+                            if len(selected) >= MAX_GROUPS_PER_LOTTERY:
+                                messagebox.showwarning('群数达到上限', f'每个彩种最多绑定{MAX_GROUPS_PER_LOTTERY}群。', parent=chooser)
+                                return
+                            selected.append(gid)
+                    refresh_choices()
+                def remove_selected():
+                    for index in reversed(current.curselection()):
+                        selected.pop(index)
+                    refresh_choices()
+                ttk.Button(actions, text='添加 →', command=add_selected).pack(pady=(72, 8))
+                ttk.Button(actions, text='← 移除', command=remove_selected).pack()
+                search.trace_add('write', refresh_choices)
+                available.bind('<Double-1>', lambda _: add_selected())
+                current.bind('<Double-1>', lambda _: remove_selected())
+                footer_buttons = ttk.Frame(chooser, padding=(12, 0, 12, 12))
+                footer_buttons.pack(fill='x')
+                def confirm():
+                    group_bindings[lot] = list(selected)
+                    on_change()
                     chooser.destroy()
-
-                search_var.trace_add('write', refresh_group_list)
-                search_entry.bind('<Return>', choose)
-                listing.bind('<Return>', choose)
-                listing.bind('<Double-1>', choose)
-                chooser.bind('<Escape>', lambda event: chooser.destroy())
-
-                buttons = ttk.Frame(chooser, padding=(12, 0, 12, 12))
-                buttons.pack(fill='x')
-                ttk.Button(buttons, text='取消', command=chooser.destroy).pack(side='right')
-                ttk.Button(buttons, text='选定', style='Accent.TButton', command=choose).pack(side='right', padx=(0, 8))
-
-                refresh_group_list()
-                search_entry.focus_set()
-            ttk.Button(row, text='选择', command=select_group).pack(side='left', padx=(8,0))
+                ttk.Button(footer_buttons, text='取消', command=chooser.destroy).pack(side='right')
+                ttk.Button(footer_buttons, text='保存本页选择', command=confirm, style='Accent.TButton').pack(side='right', padx=(0, 8))
+                refresh_choices()
+            ttk.Button(row, text='管理多群', command=manage_groups).pack(side='left', padx=(8,0))
+        send_stop_notice = tk.BooleanVar(value=settings['wechat'].get('send_stop_notice', False))
+        special_reminder = tk.BooleanVar(value=settings['wechat'].get('special_day_reminder', False))
+        ttk.Checkbutton(wechat_page, text='定时向所有已绑定群发送“福停止收单 / 体停止收单”',
+                        variable=send_stop_notice).pack(anchor='w', pady=(9, 2))
+        ttk.Checkbutton(wechat_page, text='周六21:10 / 周四21:20提前3分钟提醒（前台弱提醒、后台置顶弹窗）',
+                        variable=special_reminder).pack(anchor='w', pady=(0, 5))
+        ttk.Label(wechat_page, text='发送和提醒互不依赖。多群按队列顺序发送；程序未运行或错过发送分钟不会补发，失败不会自动重发。',
+                  foreground=MUTED, wraplength=690).pack(anchor='w', pady=(0, 7))
         receiver_label = ttk.Label(wechat_page, text=self.wechat.status, wraplength=720)
         receiver_label.pack(anchor='w', pady=8)
         def copy_bridge():
@@ -3750,14 +3897,18 @@ class RiskApp(ShortcutMixin, tk.Tk):
                                       max_concurrency=int(concurrency.get()), reasoning_effort=reasoning.get(),
                                       transport=transport_labels[transport_choice.get()])
                 selected_backend = {'微信4.x本地监听（推荐）':'wechat4','本机消息桥接':'bridge','WCF采集服务':'wcf'}[backend.get()]
+                if selected_backend == 'bridge' and send_stop_notice.get():
+                    raise ValueError('本机消息桥接目前只接收消息，无法自动发送；请改用微信4.x或WCF')
                 interval = float(fields['poll_interval'].get())
                 if not 0.2 <= interval <= 5:
                     raise ValueError('微信监听间隔须为0.2～5秒')
                 settings['wechat'].update(backend=selected_backend, auto_start=auto_start.get(), filter_self=filter_self.get(), poll_interval=interval,
                                           wechat4_account=fields['wechat4_account'].get().strip(),
                                           bridge_port=int(fields['bridge_port'].get()), wcf_host=fields['wcf_host'].get().strip(),
-                                          wcf_port=int(fields['wcf_port'].get()), fc_group=group_ids['fc_group'].get().strip(),
-                                          tc_group=group_ids['tc_group'].get().strip())
+                                          wcf_port=int(fields['wcf_port'].get()),
+                                          fc_groups=list(group_bindings['福彩']), tc_groups=list(group_bindings['体彩']),
+                                          send_stop_notice=send_stop_notice.get(),
+                                          special_day_reminder=special_reminder.get())
                 mapping = {}
                 for line in aliases.get('1.0','end-1c').splitlines():
                     if line.strip():
@@ -3870,6 +4021,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def close(self):
         if self._closing:
             return
+        if hasattr(self, 'risk_search') and self._filter_lottery in LOTTERIES:
+            self._risk_search_by_lottery[self._filter_lottery] = self.risk_search.get().strip()
+            self._ui_state.data['risk_search_by_lottery'] = dict(self._risk_search_by_lottery)
+            self._ui_state.save()
         self._save_records_split()
         self._save_risk_split()
         self._v280_store_window_state()
@@ -3897,6 +4052,8 @@ class RiskApp(ShortcutMixin, tk.Tk):
                 pass
             self._wechat_start_timer = None
         self.wechat.stop()
+        self.wechat_send_pool.shutdown(wait=False, cancel_futures=True)
+        self.wechat_history_pool.shutdown(wait=False, cancel_futures=True)
         self.pool.shutdown(wait=False, cancel_futures=True)
         self.risk_pool.shutdown(wait=False, cancel_futures=True)
         self.optimizer_pool.shutdown(wait=False, cancel_futures=True)

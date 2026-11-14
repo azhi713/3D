@@ -347,6 +347,11 @@ DEFAULT_SETTINGS = {
     "wechat": {
         "fc_group": "",
         "tc_group": "",
+        # V288: when lists exist, they supersede the legacy single-group keys.
+        "fc_groups": [],
+        "tc_groups": [],
+        "send_stop_notice": False,
+        "special_day_reminder": False,
         # 推荐：微信4.x本地数据库增量监听；仍保留bridge/WCF兼容。
         "backend": "wechat4",
         "auto_start": True,
