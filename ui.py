@@ -63,7 +63,12 @@ class RecordTable(tk.Frame):
         self._vars = {}
         self.on_selection_change = None
         self._weights = {'raw': 1}
-        self._mins = {key: max(55, int(width)) for key, _title, width in columns}
+        # In the split view, the raw-text column flexes with the available
+        # right-hand width; its original 420px minimum would force overflow.
+        self._mins = {key: (180 if key == 'raw' else max(55, int(width)))
+                      for key, _title, width in columns}
+        self._raw_column = next((i for i, col in enumerate(columns, 1) if col[0] == 'raw'), None)
+        self._raw_wrap = 180
 
         # 表头和数据区共用同一网格列；滚动条独占右侧一列。
         # 这样滚动条出现后，表头不会比数据区多出一截宽度。
@@ -94,7 +99,7 @@ class RecordTable(tk.Frame):
         self.inner = tk.Frame(self.canvas, bg='white')
         # Individual canvas windows avoid a >32767px native child window on Windows.
         self._layout_timer=None
-        self.canvas.bind('<Configure>', self._schedule_layout)
+        self.canvas.bind('<Configure>', self._resize_record_rows)
         self.canvas.bind('<MouseWheel>', self._wheel)
         self.inner.bind('<MouseWheel>', self._wheel)
         for widget in (header, self.canvas, self.inner):
@@ -106,6 +111,19 @@ class RecordTable(tk.Frame):
         if event.delta:
             self.canvas.yview_scroll(int(-event.delta/120), 'units')
         return 'break'
+
+    def _resize_record_rows(self, event=None):
+        # Tk Label's old 720px wraplength sets its requested width, even when
+        # the grid column has a smaller minimum. Follow the live split width.
+        if self._raw_column is not None:
+            width = event.width if event is not None else self.canvas.winfo_width()
+            fixed = 34 + 18 + sum(value for key, value in self._mins.items() if key != 'raw')
+            wrap = max(150, min(680, width - fixed - 18))
+            if abs(wrap - self._raw_wrap) >= 8:
+                self._raw_wrap = wrap
+                for row in self._rows.values():
+                    row['widgets'][self._raw_column].configure(wraplength=wrap)
+        self._schedule_layout()
 
     def _schedule_layout(self,event=None):
         if not getattr(self.winfo_toplevel(),'_closing',False) and not self._layout_timer:
@@ -282,7 +300,7 @@ class RecordTable(tk.Frame):
             value = values[col-1] if col-1 < len(values) else ''
             text = self._preview(value) if key == 'raw' else str(value)
             name = 'status' if key == 'status' else key
-            lbl = tk.Label(frame, name=name, text=text, bg='white', fg=INK, bd=1, relief='solid', padx=6, pady=5, anchor='w' if key=='raw' else 'center', justify='left', wraplength=720 if key=='raw' else 0)
+            lbl = tk.Label(frame, name=name, text=text, bg='white', fg=INK, bd=1, relief='solid', padx=6, pady=5, anchor='w' if key=='raw' else 'center', justify='left', wraplength=self._raw_wrap if key=='raw' else 0)
             lbl.grid(row=0,column=col,sticky='nsew')
             frame.columnconfigure(col, weight=self._weights.get(key,0), minsize=self._mins[key])
             widgets.append(lbl)
@@ -529,6 +547,10 @@ class RiskApp(ShortcutMixin, tk.Tk):
         style.configure('TButton', padding=(12, 7), font=('Microsoft YaHei UI', 10))
         style.configure('Accent.TButton', background=BLUE, foreground='white')
         style.map('Accent.TButton', background=[('active', '#1d4ed8')])
+        # Compact tall action in the narrow column beside manual entry.
+        style.configure('VerticalAdd.TButton', background=BLUE, foreground='white',
+                        padding=(5, 11))
+        style.map('VerticalAdd.TButton', background=[('active', '#1d4ed8')])
         style.configure('Treeview', rowheight=34, background='white', fieldbackground='white', borderwidth=1, relief='solid', font=('Microsoft YaHei UI', 10))
         style.configure('Treeview.Heading', background='#eaf0fa', foreground=INK, padding=(6, 9), font=('Microsoft YaHei UI', 10, 'bold'))
         style.map('Treeview', background=[('selected', '#dce8ff')], foreground=[('selected', INK)])
@@ -611,8 +633,17 @@ class RiskApp(ShortcutMixin, tk.Tk):
         ttk.Label(filters, text='元').pack(side='left', padx=(4, 0))
 
         # V272：七项核心指标；方案盈亏只在顶部展示，今日总盈亏固定放最后。
-        metrics = ttk.Frame(self)
-        metrics.pack(fill='x', padx=pad, pady=(0, 8))
+        metrics_shell = ttk.Frame(self)
+        metrics_shell.pack(fill='x', padx=pad, pady=(0, 8))
+        self._v283_metrics_shell = metrics_shell
+        metrics_shell.columnconfigure(0, weight=3, uniform='overview')
+        metrics_shell.columnconfigure(1, weight=2, uniform='overview')
+        metrics = ttk.Frame(metrics_shell)
+        metrics.grid(row=0, column=0, sticky='nsew')
+        # V283: a permanent, read-only 1000–10000元 distribution lives here.
+        # Its values are populated by the dashboard from the actual 1000 outcomes.
+        self._v283_distribution_host = ttk.Frame(metrics_shell)
+        self._v283_distribution_host.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
         self.cards = {}
         metric_specs = [
             ('income', '今日收入'),
@@ -627,14 +658,14 @@ class RiskApp(ShortcutMixin, tk.Tk):
             row, col = divmod(i, 4)
             metrics.columnconfigure(col, weight=1, uniform='metric')
             card_bg = '#eaf7ef' if key == 'total_profit' else 'white'
-            card = tk.Frame(metrics, bg=card_bg, bd=1, relief='solid', padx=12, pady=7, height=86)
+            card = tk.Frame(metrics, bg=card_bg, bd=1, relief='solid', padx=8, pady=7, height=86)
             card.grid(row=row, column=col,
                       sticky='ew', padx=(0, 8 if col < 3 else 0), pady=(0, 5))
             card.pack_propagate(False)
             tk.Label(card, text=label, bg=card_bg, fg=MUTED).pack(anchor='w')
             value = tk.Label(card, text='—', bg=card_bg,
                              fg=RED if key in ('loss', 'payout') else INK,
-                             font=('Microsoft YaHei UI', 17 if key != 'total_profit' else 19, 'bold'))
+                             font=('Microsoft YaHei UI', 15 if key != 'total_profit' else 17, 'bold'))
             value.pack(anchor='w', pady=(1, 0))
             self.cards[key] = value
 
@@ -655,7 +686,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.status.grid(row=0, column=1, sticky='ew', padx=(0, pad), pady=6)
 
         # V2732：八张顶栏卡片尺寸相同；开奖号码仅显示输入与联网获取。
-        draw_metric = tk.Frame(metrics, bg='white', bd=1, relief='solid', padx=12,
+        draw_metric = tk.Frame(metrics, bg='white', bd=1, relief='solid', padx=8,
                                pady=7, height=86)
         draw_metric.grid(row=1, column=3, sticky='ew', padx=(0, 0), pady=(0, 5))
         draw_metric.pack_propagate(False)
@@ -684,31 +715,51 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.risks_page = risks_page
 
 
-        # 第一页：录入区固定在上，记录表独占剩余全部空间。
-        input_box = ttk.LabelFrame(records_page, text='手动补录', padding=(12, 9))
-        input_box.pack(fill='x', pady=(9, 8))
+        # V283: manually resize the entry/record ratio; preserve across restarts.
+        self.records_pane = tk.PanedWindow(records_page, orient='horizontal', bd=0,
+                                           sashwidth=8, sashrelief='flat',
+                                           showhandle=True, bg=GRID)
+        self.records_pane.pack(fill='both', expand=True, pady=(9, 0))
+        input_panel = ttk.Frame(self.records_pane)
+        record_panel = ttk.Frame(self.records_pane)
+        self.records_pane.add(input_panel, minsize=240, stretch='always')
+        self.records_pane.add(record_panel, minsize=440, stretch='always')
+        self._records_sash_initialized = False
+        self.records_pane.bind('<Configure>', self._position_initial_records_split)
+        self.records_pane.bind('<ButtonRelease-1>', self._save_records_split, add='+')
+        input_box = ttk.LabelFrame(input_panel, text='手动补录', padding=(12, 9))
+        input_box.pack(fill='both', expand=True, padx=(0, 4))
         input_row = ttk.Frame(input_box)
-        input_row.pack(fill='x')
-        self.input = tk.Text(input_row, height=3, wrap='word', relief='solid', bd=1,
+        input_row.pack(fill='both', expand=True)
+        self.input = tk.Text(input_row, height=12, wrap='word', relief='solid', bd=1,
                              bg='white', fg=INK)
-        self.input.pack(side='left', fill='x', expand=True)
+        self.input.pack(side='left', fill='both', expand=True)
         self.input.bind('<Return>', self.add_event)
         self.input.bind('<Shift-Return>', lambda event: None)
-        side = ttk.Frame(input_row)
-        side.pack(side='right', padx=(10, 0))
-        ttk.Button(side, text='添加投注', style='Accent.TButton', command=self.add_manual).pack(fill='x')
-        ttk.Label(side, text='Shift+Enter 换行', foreground=MUTED).pack(pady=(6, 0))
+        # The add action occupies a narrow vertical column, centred beside
+        # the text area; neither the button nor hint widens the entry panel.
+        side = ttk.Frame(input_row, width=82)
+        side.pack(side='right', fill='y', padx=(8, 0))
+        side.pack_propagate(False)
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(0, weight=1)
+        add_stack = ttk.Frame(side)
+        add_stack.grid(row=0, column=0)
+        ttk.Button(add_stack, text='添加', width=6, style='VerticalAdd.TButton',
+                   command=self.add_manual).pack()
+        ttk.Label(add_stack, text='Shift+Enter\n换行', foreground=MUTED,
+                  font=('Microsoft YaHei UI', 8), justify='center').pack(pady=(7, 0))
         receipt_row = ttk.Frame(input_box)
         receipt_row.pack(fill='x', pady=(7, 0))
         ttk.Label(receipt_row, text='已确认实收').pack(side='left')
         ttk.Entry(receipt_row, textvariable=self.receipt, width=10).pack(side='left', padx=6)
         ttk.Label(receipt_row, text='元（留空按应收）').pack(side='left')
-        ttk.Label(receipt_row, text='例：358421组六10倍，293单组各50倍',
-                  foreground=MUTED).pack(side='right')
+        ttk.Label(input_box, text='例：358421组六10倍，293单组各50倍',
+                  foreground=MUTED).pack(fill='x', pady=(5, 0))
         self.add_feedback = ttk.Label(input_box, text='', foreground='#167647')
         self.add_feedback.pack(fill='x', anchor='w', pady=(4, 0))
 
-        notebook = ttk.Notebook(records_page)
+        notebook = ttk.Notebook(record_panel)
         notebook.pack(fill='both', expand=True)
         records_tab, guide_tab = ttk.Frame(notebook), ttk.Frame(notebook)
         notebook.add(records_tab, text='投注记录')
@@ -734,16 +785,20 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.records_tree.on_selection_change = self._update_record_selection_count
         actions = ttk.Frame(records_tab)
         actions.grid(row=2, column=0, sticky='ew', pady=(7, 3))
+        selection_actions = ttk.Frame(actions)
+        selection_actions.pack(fill='x')
         for title,callback in [('全选',lambda:self.records_tree.select_all()),('反选',lambda:self.records_tree.invert_selection()),
                                ('取消选择',lambda:self.records_tree.clear_selection()),
                                ('选中待处理',lambda:self.select_record_status(False))]:
-            ttk.Button(actions,text=title,command=callback).pack(side='left',padx=(0,5))
+            ttk.Button(selection_actions,text=title,command=callback).pack(side='left',padx=(0,5))
+        record_actions = ttk.Frame(actions)
+        record_actions.pack(fill='x', pady=(4, 0))
         for title, command in [
             ('查看', self.view_record), ('修改／实收', self.edit_record),
             ('重新识别', self.reparse_selected), ('AI转换', self.ai_selected),
             ('删除', self.delete_selected),
         ]:
-            ttk.Button(actions, text=title, command=command).pack(side='left', padx=(0, 6))
+            ttk.Button(record_actions, text=title, command=command).pack(side='left', padx=(0, 6))
         ttk.Label(records_tab, text='单击复选框或双击行选中；右键可全选、反选和删除当前数据',
                   foreground=MUTED).grid(row=3, column=0, sticky='w', pady=(1, 3))
         guide = tk.Text(guide_tab, wrap='word', bg='white', relief='solid', bd=1)
@@ -2773,6 +2828,62 @@ class RiskApp(ShortcutMixin, tk.Tk):
             self.warning.configure(text='数据处理失败，原始消息仍保留：'+str(exc), fg=RED)
         self._timer = self.after(200, self.pump)
 
+    # V283: independent, recoverable width for the manual-entry/records split.
+    def _records_split_target(self, width):
+        saved = self._ui_state.data.get('records_split')
+        if isinstance(saved, dict):
+            try:
+                old_width, old_x = int(saved['pane_width']), int(saved['sash_x'])
+                ratio = float(saved['ratio'])
+                if old_width >= 680 and 240 <= old_x <= old_width - 440 and 0 < ratio < 1:
+                    requested = old_x if old_width == width else round(width * ratio)
+                    return max(240, min(width - 440, requested))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+        return max(240, min(width - 440, round(width * 0.4)))
+
+    def _position_initial_records_split(self, event=None):
+        try:
+            width = event.width if event is not None else self.records_pane.winfo_width()
+            if width < 680 or (self._records_sash_initialized
+                               and getattr(self, '_records_pane_previous_width', None) == width):
+                return
+            self._records_pane_previous_width = width
+            timer = getattr(self, '_records_split_restore_timer', None)
+            if timer is not None:
+                self.after_cancel(timer)
+            self._records_split_restore_timer = self.after_idle(self._apply_saved_records_split)
+        except (tk.TclError, IndexError):
+            pass
+
+    def _apply_saved_records_split(self):
+        self._records_split_restore_timer = None
+        try:
+            width = self.records_pane.winfo_width()
+            if width < 680:
+                return
+            self.records_pane.sash_place(0, self._records_split_target(width), 1)
+            self._records_pane_previous_width = width
+            self._records_sash_initialized = True
+        except (tk.TclError, IndexError):
+            pass
+
+    def _save_records_split(self, event=None):
+        if getattr(self, '_closing', False) or not self._records_sash_initialized:
+            return
+        try:
+            width = self.records_pane.winfo_width()
+            sash_x = int(self.records_pane.sash_coord(0)[0])
+            if width < 680 or sash_x < 240 or width - sash_x < 440:
+                return
+            self._ui_state.data['records_split'] = {
+                'pane_width': width, 'sash_x': sash_x,
+                'ratio': round(sash_x / width, 8),
+            }
+            self._ui_state.save()
+        except (tk.TclError, IndexError, AttributeError, ValueError, OSError):
+            pass
+
     # V2733-RISK-SASH-PERSISTENCE
     def _risk_split_target(self, height):
         """相同高度精确恢复像素；高度变更则按上次拖动比例缩放。"""
@@ -3739,6 +3850,11 @@ class RiskApp(ShortcutMixin, tk.Tk):
 百8定位5倍
 百8十2定位5倍
 百069十568个14定位8倍
+百位 2 3 5 7
+十位 1 3 5 6
+个位 4 5 8 9
+福直选定位1倍 合128     三个位置各4码，共64注，每注2元
+也可写“福直选定位半倍”；同一位置重复数字按重复投注计费并计奖。
 跨度6 10倍            跨度0～9
 
 可写“组六358421 10倍”“复试5781一倍”，或在数字间加空格；“复式”仍兼容为旧写法。
@@ -3754,6 +3870,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
     def close(self):
         if self._closing:
             return
+        self._save_records_split()
         self._save_risk_split()
         self._v280_store_window_state()
         self._save_ui_scope()

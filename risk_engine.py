@@ -5,6 +5,7 @@ from decimal import Decimal
 from config import RULES_BY_LOTTERY
 from models import RiskRow, cents, money
 from itertools import permutations, combinations
+from math import prod
 
 RESULTS = tuple(f'{i:03d}' for i in range(1000))
 
@@ -71,7 +72,16 @@ class RiskEngine:
         wins = winning_indices(bet.play, bet.selection, bool(self.policy.get('span0_wins')))
         if int(result) not in wins:
             return 0
-        return int(round(self.prize_cents(lottery, bet, result) * float(bet.multiplier))) / 100
+        return (int(round(self.prize_cents(lottery, bet, result) * float(bet.multiplier)))
+                * self._position_ticket_count(bet, result)) / 100
+
+    @staticmethod
+    def _position_ticket_count(bet, result):
+        """Count repeated positional purchases without losing their payouts."""
+        if not bet.play.endswith('码定位'):
+            return 1
+        return prod(digits.count(result['百十个'.index(position)])
+                    for position, digits in (part.split(':') for part in bet.selection.split('|')))
 
     def prize_cents(self, lottery, bet, result):
         rule = self.rules[lottery][bet.play]
@@ -107,7 +117,7 @@ class RiskEngine:
             for index in winning_indices(bet.play, bet.selection, bool(self.policy.get('span0_wins'))):
                 actual=(int(round(self.prize_cents(lottery,bet,RESULTS[index])*float(bet.multiplier)))
                         if bet.play=='三码定位' and index%111==0 else prize)
-                payouts[index] += actual
+                payouts[index] += actual * self._position_ticket_count(bet, RESULTS[index])
         rows = []
         for result, payout in zip(RESULTS, payouts):
             loss = payout - revenue_cents

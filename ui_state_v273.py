@@ -19,6 +19,11 @@ class UIStateV273:
                      'period_range': '7', 'window_geometry': '', 'window_zoomed': False}
         # V283-DISPLAY-SNAPSHOT-PROFIT-TARGET: include target in persisted-key allowlist.
         self.data.setdefault('target_profit_yuan', '')
+        self.data.setdefault('target_loss_yuan', '')
+        # None means "never migrated"; an explicit empty string means the user
+        # cleared the unified target and must not resurrect a legacy value.
+        self.data.setdefault('target_goal_yuan', None)
+        self.data.setdefault('records_split', {})
         # V281-THRESHOLD-STEP-SETTING: include in persisted-key allowlist.
         self.data.setdefault('threshold_step_yuan', '1000')
         # V280-EIGHT-CARDS-FOUR-PLAN-DASHBOARD: loaded JSON may contain these keys.
@@ -32,7 +37,8 @@ class UIStateV273:
         except (OSError, ValueError, TypeError):
             pass
         for key, default in (('scopes', {}), ('hidden_periods', []), ('actual_hedges', {}),
-                             ('manual_hedge_plans', {}), ('risk_split', {}), ('hedge_modes', {})):
+                             ('manual_hedge_plans', {}), ('risk_split', {}),
+                             ('records_split', {}), ('hedge_modes', {})):
             if not isinstance(self.data[key], type(default)):
                 self.data[key] = default
         if self.data['period_range'] not in ('7', '30', 'all'):

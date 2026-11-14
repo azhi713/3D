@@ -11,7 +11,7 @@ import json
 import tkinter as tk
 from tkinter import ttk, messagebox, font as tkfont
 from dashboard_v282 import DashboardV282Mixin
-from dashboard_v280 import PlanComparisonTable, LABELS, MODES, INK, MUTED, RED, GREEN
+from dashboard_v280 import PlanComparisonTable, LABELS, MODES, INK, MUTED, RED, GREEN, BG
 from dashboard_v281 import save_purchase_checked
 from dashboard_metrics_v280 import (aggregate_rows, format_yuan, purchased_metrics)
 from plan_snapshot_v283 import (DisplayedPlan, build_displayed_plan, parse_profit_target,
@@ -83,6 +83,16 @@ def _v283_loss_outcomes(metrics, loss_cents):
                  if profit <= -loss_cents)
 
 
+def _v283_tier_counts(profits_cents):
+    """Ten paired, independent tails of the SAME 1000-outcome P&L vector."""
+    if len(profits_cents) != 1000:
+        raise ValueError('盈亏档位统计需要完整1000个开奖结果')
+    return tuple((yuan,
+                  sum(value >= yuan * 100 for value in profits_cents),
+                  sum(value <= -yuan * 100 for value in profits_cents))
+                 for yuan in range(1000, 10001, 1000))
+
+
 def _v283_migrate_signed_target(profit_raw, loss_raw):
     """Move an old negative profit target to the new positive loss field."""
     if profit_raw.strip().startswith('-'):
@@ -131,6 +141,8 @@ class DashboardV283Mixin(DashboardV282Mixin):
         self.optimizer_compare_table.grid(row=2, column=0, sticky='ew', pady=(0, 7))
         self.restore_system_plan_button.configure(text='按当前阈值重算', command=self._restore_system_plan)
         self._v283_build_target_control()
+        if hasattr(self, '_v283_distribution_host'):
+            self._v283_build_distribution()
         self._v283_ready = True
         self._render_plan()
         self._update_financial_cards()
@@ -138,26 +150,26 @@ class DashboardV283Mixin(DashboardV282Mixin):
     def _v283_build_target_control(self):
         stored_profit = self._ui_state.data.get('target_profit_yuan', '')
         stored_loss = self._ui_state.data.get('target_loss_yuan', '')
+        saved_goal = self._ui_state.data.get('target_goal_yuan', None)
         stored_profit = stored_profit if isinstance(stored_profit, str) else ''
         stored_loss = stored_loss if isinstance(stored_loss, str) else ''
-        profit_raw, loss_raw = _v283_migrate_signed_target(stored_profit, stored_loss)
+        # Existing installs used two independent fields, and earlier builds
+        # accepted negative values. Choose a single positive absolute target.
+        if isinstance(saved_goal, str):
+            goal_raw = saved_goal
+        else:
+            goal_raw = (stored_profit or stored_loss).lstrip('-').strip()
         try:
-            self._v283_target = parse_profit_target(profit_raw)
-            if self._v283_target is not None and self._v283_target < 0:
-                raise ValueError('目标盈利请填写非负金额')
+            self._v283_target = _v283_parse_unsigned_target(goal_raw, '目标盈亏')
         except ValueError:
-            profit_raw = ''; self._v283_target = None
-        try:
-            loss_cents = parse_profit_target(loss_raw)
-            if loss_cents is not None and loss_cents < 0:
-                raise ValueError('目标亏损请填写非负金额')
-            self._v283_loss_target = loss_cents
-        except ValueError:
-            loss_raw = ''; self._v283_loss_target = None
-        self._v283_saved_target = stored_profit
-        self._v283_saved_loss = stored_loss
-        self.target_profit = tk.StringVar(self, value=profit_raw)
-        self.target_loss = tk.StringVar(self, value=loss_raw)
+            goal_raw = ''; self._v283_target = None
+        self._v283_loss_target = self._v283_target
+        self._v283_saved_target = goal_raw
+        self._v283_saved_loss = goal_raw
+        self._v283_saved_goal = saved_goal
+        self.target_profit = tk.StringVar(self, value=goal_raw)
+        # Kept for comparison and dialog compatibility; not a second input.
+        self.target_loss = tk.StringVar(self, value=goal_raw)
         # Physically after the history button, not in the plan's copy/action bar.
         box = ttk.Frame(self.history_button.master)
         box.pack(side='left', after=self.history_button, padx=(12, 0))
@@ -170,7 +182,7 @@ class DashboardV283Mixin(DashboardV282Mixin):
         count_width = max(measured_font.measure('盈利达标：1000组 *'),
                           measured_font.measure('亏损达标：1000组 *')) + 6
         count_height = measured_font.metrics('linespace') + 6
-        ttk.Label(box, text='目标盈利', font=('Microsoft YaHei UI', 9)).pack(side='left')
+        ttk.Label(box, text='目标盈亏', font=('Microsoft YaHei UI', 9)).pack(side='left')
         self.target_profit_entry = ttk.Entry(box, textvariable=self.target_profit,
                                              width=9, justify='right')
         self.target_profit_entry.pack(side='left', padx=(5, 3))
@@ -187,13 +199,8 @@ class DashboardV283Mixin(DashboardV282Mixin):
                                                     command=self._v283_open_target_dialog,
                                                     state='disabled')
         self.target_profit_view_button.pack(side='left', padx=(6, 0))
-        ttk.Label(box, text='目标亏损', font=('Microsoft YaHei UI', 9)).pack(side='left', padx=(12, 0))
-        self.target_loss_entry = ttk.Entry(box, textvariable=self.target_loss,
-                                           width=9, justify='right')
-        self.target_loss_entry.pack(side='left', padx=(5, 3))
-        ttk.Label(box, text='元', font=('Microsoft YaHei UI', 9)).pack(side='left')
         loss_slot = ttk.Frame(box, width=count_width, height=count_height)
-        loss_slot.pack(side='left', padx=(6, 0))
+        loss_slot.pack(side='left', padx=(12, 0))
         loss_slot.pack_propagate(False)
         self.target_loss_count = ttk.Label(loss_slot, text='亏损达标：—', foreground=MUTED,
                                            font=count_font, cursor='hand2', anchor='w')
@@ -207,13 +214,50 @@ class DashboardV283Mixin(DashboardV282Mixin):
         self.target_profit_source = ttk.Label(box, text='', foreground=MUTED,
                                               font=('Microsoft YaHei UI', 8))
         self.target_profit_source.pack(side='left', padx=(8, 0))
-        self._v283_previous_goal_text = (profit_raw, loss_raw)
+        self._v283_previous_goal_text = goal_raw
         self.target_profit.trace_add('write', self._v283_target_changed)
-        self.target_loss.trace_add('write', self._v283_target_changed)
         self.target_profit_entry.bind('<Return>', self._v283_commit_target)
         self.target_profit_entry.bind('<FocusOut>', self._v283_commit_target)
-        self.target_loss_entry.bind('<Return>', self._v283_commit_target)
-        self.target_loss_entry.bind('<FocusOut>', self._v283_commit_target)
+
+    def _v283_build_distribution(self):
+        panel = ttk.LabelFrame(self._v283_distribution_host,
+                               text='盈亏达标数 · 1000～10000元', padding=(6, 4))
+        panel.pack(fill='both', expand=True)
+        # A compact six-column table, matching the plan-comparison grid:
+        # two groups of five tiers, with visible borders and aligned values.
+        grid = tk.Frame(panel, bg='#c3cfdf', bd=1, relief='solid')
+        grid.pack(fill='both', expand=True)
+        self._v283_tier_labels = {}
+        for col, title in enumerate(('目标≥', '盈利组数', '亏损组数') * 2):
+            grid.columnconfigure(col, weight=1, minsize=62 if col % 3 == 0 else 72)
+            tk.Label(grid, text=title, fg=INK, bg='#eaf0f8', anchor='e',
+                     font=('Microsoft YaHei UI', 9), padx=5, pady=3).grid(
+                         row=0, column=col, sticky='nsew', padx=(0, 1), pady=(0, 1))
+        grid.rowconfigure(0, weight=1, minsize=24)
+        for i, yuan in enumerate(range(1000, 10001, 1000)):
+            row, block = i % 5 + 1, (i // 5) * 3
+            background = 'white' if row % 2 else '#f7f9fc'
+            grid.rowconfigure(row, weight=1, minsize=24)
+            tk.Label(grid, text=f'{yuan:,}', bg=background, fg=INK,
+                     font=('Consolas', 9), anchor='e', padx=5).grid(
+                         row=row, column=block, sticky='nsew', padx=(0, 1), pady=(0, 1))
+            profit_label = tk.Label(grid, text='—', bg=background, fg=GREEN,
+                                    font=('Consolas', 9), anchor='e', padx=5)
+            loss_label = tk.Label(grid, text='—', bg=background, fg=RED,
+                                  font=('Consolas', 9), anchor='e', padx=5)
+            profit_label.grid(row=row, column=block+1, sticky='nsew', padx=(0, 1), pady=(0, 1))
+            loss_label.grid(row=row, column=block+2, sticky='nsew', padx=(0, 1), pady=(0, 1))
+            self._v283_tier_labels[yuan] = (profit_label, loss_label)
+        self._v283_distribution_note = ttk.Label(panel, text='', foreground=MUTED,
+                                                  font=('Microsoft YaHei UI', 8))
+        self._v283_distribution_note.pack(fill='x', pady=(3, 0))
+
+    def _v283_distribution_status(self, status='—'):
+        for profit_label, loss_label in self._v283_tier_labels.values():
+            profit_label.configure(text=status)
+            loss_label.configure(text=status)
+        if hasattr(self, '_v283_distribution_note'):
+            self._v283_distribution_note.configure(text='等待本期实际盈亏数据')
 
     def _v283_set_target_numbers(self, numbers, kind='profit'):
         """Only publish numbers from the same completed calculation as the count."""
@@ -406,9 +450,9 @@ class DashboardV283Mixin(DashboardV282Mixin):
     def _v283_target_changed(self, *_):
         if self._closing:
             return
-        new_text = (self.target_profit.get(), self.target_loss.get())
+        new_text = self.target_profit.get()
         before = getattr(self, '_v283_previous_goal_text', new_text)
-        deleting = any(len(current) < len(previous) for current, previous in zip(new_text, before))
+        deleting = len(new_text) < len(before)
         self._v283_previous_goal_text = new_text
         self._v283_set_target_numbers(None)
         self._v283_set_target_numbers(None, 'loss')
@@ -417,7 +461,7 @@ class DashboardV283Mixin(DashboardV282Mixin):
         # Do not leave old target counts labelled as the newly typed amount.
         self.target_profit_count.configure(text='盈利达标：' + ('输入中' if self.target_profit.get().strip() else '—'),
                                            foreground=MUTED)
-        self.target_loss_count.configure(text='亏损达标：' + ('输入中' if self.target_loss.get().strip() else '—'),
+        self.target_loss_count.configure(text='亏损达标：' + ('输入中' if new_text.strip() else '—'),
                                          foreground=MUTED)
         self.target_profit_source.configure(text='')
         self._v283_goal_timer = self.after(INPUT_DELETE_IDLE_MS if deleting else INPUT_IDLE_MS,
@@ -446,26 +490,21 @@ class DashboardV283Mixin(DashboardV282Mixin):
         if self._v283_goal_timer is not None:
             self.after_cancel(self._v283_goal_timer)
             self._v283_goal_timer = None
-        profit_raw = self.target_profit.get().strip()
-        loss_raw = self.target_loss.get().strip()
+        goal_raw = self.target_profit.get().strip()
         self._v283_target_error = ''
         self._v283_loss_target_error = ''
         try:
-            self._v283_target = _v283_parse_unsigned_target(profit_raw, '目标盈利')
+            self._v283_target = _v283_parse_unsigned_target(goal_raw, '目标盈亏')
         except ValueError as exc:
             self._v283_target = None
             self._v283_target_error = str(exc)
-        try:
-            loss_cents = _v283_parse_unsigned_target(loss_raw, '目标亏损')
-            self._v283_loss_target = loss_cents
-        except ValueError as exc:
-            self._v283_loss_target = None
-            self._v283_loss_target_error = str(exc)
+        self._v283_loss_target = self._v283_target
+        self._v283_loss_target_error = self._v283_target_error
+        # Compatibility with downstream users of the old independent loss var.
+        self.target_loss.set(goal_raw)
         updates = {}
-        if not self._v283_target_error and profit_raw != self._v283_saved_target:
-            updates['target_profit_yuan'] = profit_raw
-        if not self._v283_loss_target_error and loss_raw != self._v283_saved_loss:
-            updates['target_loss_yuan'] = loss_raw
+        if not self._v283_target_error and goal_raw != self._v283_saved_goal:
+            updates['target_goal_yuan'] = goal_raw
         if updates:
             before = {key: self._ui_state.data.get(key, '') for key in updates}
             try:
@@ -475,15 +514,12 @@ class DashboardV283Mixin(DashboardV282Mixin):
                 if path is not None:
                     persisted = json.loads(path.read_text('utf-8'))
                     if any(persisted.get(k) != value for k, value in updates.items()):
-                        raise OSError('目标盈利或亏损没有保存成功')
-                self._v283_saved_target = self._ui_state.data.get('target_profit_yuan', '')
-                self._v283_saved_loss = self._ui_state.data.get('target_loss_yuan', '')
+                        raise OSError('目标盈亏没有保存成功')
+                self._v283_saved_goal = self._ui_state.data.get('target_goal_yuan', '')
             except (OSError, ValueError, TypeError) as exc:
                 self._ui_state.data.update(before)
-                if 'target_profit_yuan' in updates:
-                    self._v283_target_error = '目标盈利未保存：' + str(exc)
-                if 'target_loss_yuan' in updates:
-                    self._v283_loss_target_error = '目标亏损未保存：' + str(exc)
+                self._v283_target_error = '目标盈亏未保存：' + str(exc)
+                self._v283_loss_target_error = self._v283_target_error
         if self._v283_ready:
             self.optimizer_compare_table.set_target(self._v283_target, bool(self._v283_target_error),
                                                      self._v283_loss_target, bool(self._v283_loss_target_error))
@@ -758,16 +794,14 @@ class DashboardV283Mixin(DashboardV282Mixin):
             self._v283_set_target_numbers(None, kind)
             label.configure(text='目标待核对' if error else caption + '：' + (status if target is not None else '—'),
                             foreground=RED if error else MUTED)
+        if hasattr(self, '_v283_tier_labels'):
+            self._v283_distribution_status(status)
 
     def _v283_update_actual_target(self):
         if not getattr(self, '_v283_ready', False):
             return
         self.target_profit_source.configure(text='')
         try:
-            if not ((self._v283_target is not None and not self._v283_target_error)
-                    or (self._v283_loss_target is not None and not self._v283_loss_target_error)):
-                self._v283_target_status('—')
-                return
             if self._v283_goal_timer is not None or self._v283_risk_busy():
                 self._v283_target_status('更新中')
                 return
@@ -782,6 +816,15 @@ class DashboardV283Mixin(DashboardV282Mixin):
             income, payouts = self._v280_inputs()
             purchase = self._v280_purchase()
             actual = purchased_metrics(income, payouts, purchase)
+            if hasattr(self, '_v283_tier_labels'):
+                for yuan, profit_count, loss_count in _v283_tier_counts(actual.profits_cents):
+                    profit_label, loss_label = self._v283_tier_labels[yuan]
+                    profit_label.configure(text=f'{profit_count}组')
+                    loss_label.configure(text=f'{loss_count}组')
+                if hasattr(self, '_v283_distribution_note'):
+                    self._v283_distribution_note.configure(
+                        text='* 收单未齐，暂估' if self.snapshot.pending else
+                             '已补单·含成本和返奖' if purchase else '未补单·按原始赔付')
             self.target_profit_source.configure(
                 text=('〔计入：' + LABELS.get(self._purchased_mode(), '人工方案')
                       + '·含成本及返奖' + ('·同步失败' if self._v283_live_failed_key else '') + '〕')

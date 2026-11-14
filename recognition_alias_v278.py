@@ -28,6 +28,18 @@ _CH_FRAC = re.compile(r'(?P<den>[一二两三四五六七八九十百])分之(?P
 _BONUS_HALF = re.compile(r'(?<![0-9])(?P<base>\d{1,5}|[一二两三四五六七八九十])\s*倍\s*半')
 _CASH_ALIAS=re.compile(r'(?P<val>半|[一二两三四五六七八九十]|\d+(?:\.\d{1,2})?)\s*(?P<unit>米|元|块|毛|角|分)')
 _BARE_DIRECT_PREFIX=re.compile(rf'^(?:{_LOT})?\s*[:：,，]?\s*\d{{3}}\s*$',re.I)
+# One expressly named position, one digit, and one whole-ticket cash amount.
+# This is an alias of the installed 一码定位 play, never a new odds rule.
+_POSITION_FIXED_DIGIT_CASH = re.compile(
+    rf'^\s*(?:{_LOT}\s*[:：]?\s*)?(?P<position>[百十个])\s*(?:位\s*)?'
+    r'(?:定\s*码|码\s*定位|定\s*位)\s*(?P<digit>[0-9])\s*'
+    r'(?:合计|总计|合|共)\s*[:：]?\s*'
+    r'(?P<amount>[0-9]+(?:\.[0-9]{1,2})?)\s*(?:元|米|块)?\s*$', re.I)
+_POSITION_FIXED_DIGIT_REVERSED = re.compile(
+    rf'^\s*(?:{_LOT}\s*[:：]?\s*)?(?P<position>[百十个])\s*(?:位\s*)?'
+    r'[:：]?\s*(?P<digit>[0-9])\s*定位\s*'
+    r'(?:合计|总计|合|共)\s*[:：]?\s*'
+    r'(?P<amount>[0-9]+(?:\.[0-9]{1,2})?)\s*(?:元|米|块)?\s*$', re.I)
 _CN_CASH = {'半': Decimal('0.5'), '一':Decimal(1), '二':Decimal(2),
             '两':Decimal(2), '三':Decimal(3), '四':Decimal(4),
             '五':Decimal(5), '六':Decimal(6), '七':Decimal(7),
@@ -194,6 +206,37 @@ def _source_bets(parser, lottery, original, prefix, mul):
     return None
 
 
+def _fixed_digit_position_cash(parser, lottery, raw, text):
+    """Prove `十位定码5 合200米` from the existing 一码定位 unit cost.
+
+    No multiplier is guessed from a grand total spanning other purchases:
+    the entire message must be this single explicit position-and-digit order.
+    """
+    m = _POSITION_FIXED_DIGIT_CASH.fullmatch(text)
+    if m is None:
+        m = _POSITION_FIXED_DIGIT_REVERSED.fullmatch(text)
+    if m is None:
+        return None
+    if not _check_lottery(text, lottery):
+        return _fail(parser, raw, '彩种标记与当前记录不一致')
+    amount = Decimal(m['amount'])
+    if amount <= 0:
+        return _fail(parser, raw, '定码投注金额必须大于零')
+    selection = m['position'] + ':' + m['digit']
+    baseline = parser._make(lottery, raw, '一码定位', selection, 1)
+    unit = Decimal(str(baseline.principal))
+    if unit <= 0:
+        return _fail(parser, raw, '一码定位单倍本金配置无效')
+    multiple = amount / unit
+    if multiple.as_tuple().exponent < -2:
+        return _fail(parser, raw, '金额无法精确换算为合法倍数（最多两位小数）')
+    bet = parser._make(lottery, raw, '一码定位', selection,
+                       parser._multiplier(format(multiple, 'f')))
+    if Decimal(str(bet.principal)) != amount:
+        return _fail(parser, raw, '一码定位金额与核算本金不一致')
+    return _finish(parser, raw, [bet], claimed=amount, unit_cash=amount)
+
+
 def _value_amount(value, unit):
     amount=_CN_CASH[value] if value in _CN_CASH else Decimal(value)
     if unit in ('角','毛'):amount /=10
@@ -302,6 +345,9 @@ def parse_alias_v278(parser, lottery, raw):
     if normalized!=text:
         return _parse_explicit_frac(parser,lottery,raw,normalized,claimed)
     try:
+        fixed_position = _fixed_digit_position_cash(parser, lottery, raw, text)
+        if fixed_position is not None:
+            return fixed_position
         result=_price_alias(parser,lottery,raw,body,claimed)
     except (ValueError,InvalidOperation,KeyError,ArithmeticError) as exc:
         return _fail(parser,raw,str(exc))

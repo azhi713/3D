@@ -134,8 +134,15 @@ class DashboardV280Mixin:
     def _v280_rebuild_cards(self):
         old=self.cards['income'].master.master
         old.destroy()
-        metrics=ttk.Frame(self)
-        metrics.pack(fill='x',padx=14,pady=(0,8),before=self.warning)
+        # V283: the card frame shares the original metrics shell with a
+        # permanent right-hand P&L distribution. Do not recreate a full-width
+        # standalone metrics bar that hides the distribution next to it.
+        shell=getattr(self, '_v283_metrics_shell', None)
+        metrics=ttk.Frame(shell if shell is not None else self)
+        if shell is not None:
+            metrics.grid(row=0,column=0,sticky='nsew')
+        else:
+            metrics.pack(fill='x',padx=14,pady=(0,8),before=self.warning)
         self._v280_metric_frame=metrics
         self.cards={}
         self._v280_badges={}
@@ -150,7 +157,7 @@ class DashboardV280Mixin:
             row,col=divmod(i,4)
             metrics.columnconfigure(col,weight=1,uniform='v280_metric')
             background='#eaf7ef' if key=='total_profit' else 'white'
-            box=tk.Frame(metrics,bg=background,bd=1,relief='solid',height=height,padx=10,pady=6)
+            box=tk.Frame(metrics,bg=background,bd=1,relief='solid',height=height,padx=7,pady=6)
             box.grid(row=row,column=col,sticky='nsew',padx=4,pady=(0,5))
             box.pack_propagate(False)
             self._v280_card_boxes.append(box)

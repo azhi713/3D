@@ -24,6 +24,17 @@ ALIAS_LOOKUP = {alias: play for play, aliases in ALIASES.items() for alias in al
 
 LOTTERY_TOKEN = r'(?:福彩\s*3[Dd]|福彩|3[Dd]|体彩\s*排列[三3]|体彩|排列[三3]|排|体|福)'
 
+# 大底简写只在“彩种 + 注数 + 玩法 + 倍数 + 明确合计”全部存在时成立。
+# 例如“福378直选半倍🈴378米”；单独的“福378直选”仍按普通投注处理。
+BARE_BIG_BOTTOM_SUMMARY = re.compile(
+    r'^\s*(?P<lot>'+LOTTERY_TOKEN+r')\s*(?P<count>\d+)\s*'
+    r'(?P<play>直选|单选|直|单|组选|组)\s*'
+    r'(?P<mult>半倍|0\.5倍|'+MULT+r'\s*倍)\s*'
+    r'(?:🈴|合计|合|共)\s*[:：]?\s*'
+    r'(?P<amount>\d+(?:\.\d{1,2})?)\s*(?:元|米|块)?\s*$',
+    re.I,
+)
+
 
 def lottery_from_token(token):
     token = re.sub(r'\s+', '', unicodedata.normalize('NFKC', token or '')).lower()
@@ -33,7 +44,10 @@ def lottery_from_token(token):
 def _summary_lottery(line):
     """大底汇总行里的彩种；返回None表示不是汇总行。"""
     match = re.match(r'^\s*('+LOTTERY_TOKEN+r')\s*\d+\s*注', unicodedata.normalize('NFKC', line or ''), re.I)
-    return lottery_from_token(match[1]) if match else None
+    if match:
+        return lottery_from_token(match[1])
+    shorthand = BARE_BIG_BOTTOM_SUMMARY.fullmatch(unicodedata.normalize('NFKC', line or ''))
+    return lottery_from_token(shorthand.group('lot')) if shorthand else None
 
 
 def split_lottery_message(text, default_lottery):
@@ -161,6 +175,20 @@ class BetParser:
         return all_bets
 
     def parse(self, lottery, text):
+        # 无‘注’大底走整单校验，不允许普通分行识别或猜单。
+        if isinstance(text, str) and '\n' in text and any(
+            BARE_BIG_BOTTOM_SUMMARY.fullmatch(unicodedata.normalize('NFKC', line.strip()))
+            for line in text.splitlines()
+        ):
+            return self._parse_legacy(lottery, text)
+        from recognition_compat_v286 import parse_compat_v286
+        compat = parse_compat_v286(self, lottery, text)
+        if compat is not None:
+            return compat
+        from recognition_mixed_v285 import parse_mixed_receipts_v285
+        mixed_receipts = parse_mixed_receipts_v285(self, lottery, text)
+        if mixed_receipts is not None:
+            return mixed_receipts
         # V281-THRESHOLD-SOURCE-CONTEXT-NO-HEDGE
         # V282-SHARED-ORDER-COPY-SCOPE
         from shared_orders_v282 import parse_shared_order
@@ -472,7 +500,7 @@ class BetParser:
         return bets
 
     def _parse_big_bottom(self, lottery, text):
-        """大底：号码块 + “福/体N注[直选/组选][半倍/1倍]合金额”。"""
+        """大底：号码块 + 带“注”汇总，或带玩法、倍数、金额的严格简写。"""
         raw = unicodedata.normalize('NFKC', text or '').replace('\r\n', '\n').replace('\r', '\n')
         lines = raw.split('\n')
         summary_re = re.compile(
@@ -480,7 +508,7 @@ class BetParser:
             r'(?P<lot2>'+LOTTERY_TOKEN+r')?\s*'
             r'(?P<play>直选|单选|直|单|组选|组)?\s*'
             r'(?P<mult>半倍|0\.5倍|'+MULT+r'\s*倍)?\s*'
-            r'(?:(?:🈴|合计|合|共)\s*[:：]?\s*(?P<amount>\d+(?:\.\d{1,2})?)\s*元?)?\s*$',
+            r'(?:(?:🈴|合计|合|共)\s*[:：]?\s*(?P<amount>\d+(?:\.\d{1,2})?)\s*[元米块]?)?\s*$',
             re.I,
         )
         groups = []
@@ -496,6 +524,8 @@ class BetParser:
                 continue
             match = summary_re.fullmatch(line.strip())
             if not match:
+                match = BARE_BIG_BOTTOM_SUMMARY.fullmatch(line.strip())
+            if not match:
                 if line.strip():
                     buffer.append(line.strip())
                 continue
@@ -507,7 +537,7 @@ class BetParser:
             if re.sub(r'\s+', ' ', number_text) and not re.fullmatch(r'\d{3}(?:\s+\d{3})*', re.sub(r'\s+', ' ', number_text)):
                 raise ValueError('大底号码块只能包含三位号码和空格/换行')
             numbers = re.findall(r'(?<!\d)\d{3}(?!\d)', number_text)
-            target_tokens = [x for x in (match.group('lot'), match.group('lot2')) if x]
+            target_tokens = [x for x in (match.group('lot'), match.groupdict().get('lot2')) if x]
             targets = {lottery_from_token(x) for x in target_tokens}
             if len(targets) > 1:
                 raise ValueError('大底汇总行彩种标记冲突')
@@ -625,8 +655,8 @@ class BetParser:
             items = selection.split('|')
             parts = [item.split(':') for item in items]
             count = {'一码定位': 1, '两码定位': 2, '三码定位': 3}[play]
-            if len(parts) != count or any(len(p) != 2 or p[0] not in '百十个' or not re.fullmatch(r'[0-9]+', p[1]) or len(set(p[1])) != len(p[1]) for p in parts) or len({p[0] for p in parts}) != count:
-                raise ValueError('定位须明确指定位置，数字不能重复')
+            if len(parts) != count or any(len(p) != 2 or p[0] not in '百十个' or not re.fullmatch(r'[0-9]+', p[1]) for p in parts) or len({p[0] for p in parts}) != count:
+                raise ValueError('定位须明确指定位置及有效数字')
             return
         if play in ('全包组三', '全包组六', '豹子'):
             if selection:

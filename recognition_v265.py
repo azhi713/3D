@@ -17,10 +17,10 @@ _LAST_TOTAL = re.compile(r'(?:合计|总计|合)\s*[:：]?\s*(\d+(?:\.\d{1,2})?)
 _EXTRA = re.compile(r'\s*(\d{3}(?:[\s,、，/\-]+\d{3})*)\s*(直选|直|单|组选|组|组三|组六)\s*(?:各)?\s*('+_CN+r')\s*倍\s*')
 _POS_BLOCK = re.compile(r'\s*(?:(?:福彩|福|体彩|体|3[Dd])\s*)?(?:定位\s*)?百\s*[:：]?\s*(\d{1,10})\s+十\s*[:：]?\s*(\d{1,10})\s+个\s*[:：]?\s*(\d{1,10})\s+(?:打|买|投)?\s*('+_CN+r')\s*倍\s*(?:共)?\s*(\d+(?:\.\d{1,2})?)\s*[元米块]?\s*')
 _POS_TRAILING = re.compile(
-    rf'^\s*(?:(?P<head>{_LOT})\s*)?百(?:位)?\s*[:：]?\s*(?P<hundred>\d{{1,10}})\s+'
-    rf'十(?:位)?\s*[:：]?\s*(?P<ten>\d{{1,10}})\s+'
-    rf'个(?:位)?\s*[:：]?\s*(?P<one>\d{{1,10}})\s+'
-    rf'(?:(?P<tail>{_LOT})\s*)?(?:三码)?定位\s*(?P<multiple>{_CN})\s*倍'
+    rf'^\s*(?:(?P<head>{_LOT})\s*)?百(?:位)?\s*[:：]?\s*(?P<hundred>[0-9](?:[ \t,，、]*[0-9]){{0,9}})\s+'
+    rf'十(?:位)?\s*[:：]?\s*(?P<ten>[0-9](?:[ \t,，、]*[0-9]){{0,9}})\s+'
+    rf'个(?:位)?\s*[:：]?\s*(?P<one>[0-9](?:[ \t,，、]*[0-9]){{0,9}})\s+'
+    rf'(?:(?P<tail>{_LOT})\s*)?(?:直选)?(?:三码)?定位\s*(?P<multiple>{_CN})\s*倍'
     rf'\s*(?:(?:🈴|合计|总计|合|共)\s*[:：]?\s*(?P<total>\d+(?:\.\d{{1,2}})?)\s*[元米块]?)?\s*$',
     re.I)
 _SHORT = re.compile(r'^\s*(?:福|福彩)?\s*(\d{3})\s*('+_CN+r')\s*(?:单|直)\s*('+_CN+r')\s*组\s*(?:福)?\s*(\d+(?:\.\d{1,2})?)\s*[元米块]?\s*$')
@@ -96,7 +96,11 @@ def _positions(p,lot,original,text):
     trail=_POS_TRAILING.fullmatch(text)
     if trail:
         from source_context_v281 import lottery_of
-        selection='百:'+trail['hundred']+'|十:'+trail['ten']+'|个:'+trail['one']
+        # Spaces/commas separate digits within one explicitly labelled
+        # position. Preserve duplicates: they are repeated purchases.
+        position_digits=[re.sub(r'[^0-9]','',trail[name])
+                         for name in ('hundred','ten','one')]
+        selection='|'.join(label+':'+digits for label,digits in zip('百十个',position_digits))
         claim=Decimal(trail['total']) if trail['total'] is not None else None
         p.last_claimed=float(claim) if claim is not None else None
         p.last_receipts=[]

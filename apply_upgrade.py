@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""福彩3D V283 增量补丁：先验证、逐文件备份、再原子替换。
+"""福彩3D V283（91110fd 基线）仅运行源码增量补丁。
 
 使用：python apply_upgrade.py --root "E:\\Python项目\\3D风险解析"
 预检：python apply_upgrade.py --root "E:\\Python项目\\3D风险解析" --check
 
-默认仅接受所依据的 GitHub 基线版本或已安装的相同补丁文件；
-如检测到本地自行修改，会拒绝覆盖并显示文件名。
+不修改 tests/、数据或数据库。一次列出所有运行源码冲突。
+接受已核对的原始版、GitHub 最新版、目标版以及仅 CRLF 不同的同版本。
+未知的本地代码修改一律拒绝覆盖；没有强制覆盖开关。
 """
 from __future__ import annotations
 
@@ -31,30 +32,51 @@ def digest(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def prepare(root: Path, manifest: dict, allow_modified: bool) -> list[tuple[Path, Path, str]]:
+def compatible_digests(path: Path) -> set[str]:
+    """Recognize Windows CRLF checkout without treating code changes as equal."""
+    raw = path.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if b'\r\n' not in raw:
+        return {actual}
+    return {actual, hashlib.sha256(raw.replace(b'\r\n', b'\n')).hexdigest()}
+
+
+def prepare(root: Path, manifest: dict) -> list[tuple[Path, Path, str]]:
     if not root.is_dir() or not all((root / item).is_file()
                                      for item in ('ui.py', 'parser.py', 'dashboard_v283.py')):
         raise ValueError('项目目录无效：应指定包含 ui.py、parser.py 的 3D风险解析项目根目录')
     actions = []
+    conflicts = []
+    if not isinstance(manifest.get('files'), dict) or not manifest['files']:
+        raise ValueError('补丁清单无效或为空')
     for name, hashes in sorted(manifest['files'].items()):
         rel = Path(name)
         if rel.is_absolute() or '..' in rel.parts:
             raise ValueError('补丁内发现不安全路径：' + name)
+        if len(rel.parts) != 1 or rel.suffix != '.py':
+            raise ValueError('本版本仅能更新项目根目录运行源码：' + name)
         source = PATCH_ROOT / 'files' / rel
         target = root / rel
-        if not source.is_file() or digest(source) != hashes['new_sha256']:
+        if source.is_symlink() or not source.is_file() or digest(source) != hashes['new_sha256']:
             raise ValueError('补丁文件校验失败：' + name)
-        if target.exists() and not target.is_file():
-            raise ValueError('目标不是文件：' + name)
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            conflicts.append(name + '（目标不是普通文件）')
+            continue
         if target.is_file():
-            current = digest(target)
-            if current == hashes['new_sha256']:
+            found = compatible_digests(target)
+            if hashes['new_sha256'] in found:
                 continue
-            if current != hashes['base_sha256'] and not allow_modified:
-                raise ValueError('本地文件与补丁基线不同，已停止以保护现有修改：' + name)
-        elif hashes['base_sha256'] is not None and not allow_modified:
-            raise ValueError('原有代码文件缺失，已停止：' + name)
+            accepted = hashes.get('accepted_sha256', [])
+            if not isinstance(accepted, list) or not found.intersection(accepted):
+                conflicts.append(name + '（未经验证的本地内容）')
+                continue
+        elif hashes.get('accepted_sha256'):
+            conflicts.append(name + '（原有文件缺失）')
+            continue
         actions.append((source, target, name))
+    if conflicts:
+        raise ValueError('共有 ' + str(len(conflicts)) + ' 个运行源码与已知基线不一致；没有修改任何文件：\n  - '
+                         + '\n  - '.join(conflicts))
     return actions
 
 
@@ -73,21 +95,19 @@ def replace_atomically(source: Path, target: Path) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description='福彩3D V283 增量升级补丁（自动备份）')
+    parser = argparse.ArgumentParser(description='福彩3D V283 运行源码专用升级补丁（自动备份）')
     parser.add_argument('--root', required=True, help='现有 3D风险解析 源码项目的根目录')
     parser.add_argument('--check', action='store_true', help='仅校验，不替换任何文件')
-    parser.add_argument('--allow-modified', action='store_true',
-                        help='允许覆盖与基线不同的文件（仍自动备份；不建议常规使用）')
     args = parser.parse_args()
     root = Path(args.root).resolve()
     manifest = json.loads((PATCH_ROOT / 'manifest.json').read_text(encoding='utf-8'))
     try:
-        actions = prepare(root, manifest, args.allow_modified)
+        actions = prepare(root, manifest)
     except (ValueError, OSError, KeyError, TypeError) as exc:
         print('CHECK_BLOCKED:', exc)
         return 2
     print('基线：', manifest.get('base_commit', 'unknown'))
-    print(f'需要替换：{len(actions)}个文件；已是目标版本的文件会跳过。')
+    print(f'需要替换：{len(actions)}个运行源码文件；已是目标版本的文件会跳过，tests/ 不参与安装。')
     if args.check or not actions:
         print('CHECK_OK：没有修改文件。' if args.check else 'ALREADY_APPLIED：无需重复升级。')
         return 0
@@ -107,6 +127,8 @@ def main() -> int:
         for source, target, name in actions:
             replace_atomically(source, target)
             completed.append((target, name))
+            if digest(target) != manifest['files'][name]['new_sha256']:
+                raise OSError('替换后校验失败：' + name)
             print('更新：', name)
     except OSError as exc:
         print('APPLY_FAILED：', exc, '；正在恢复本次已经替换的文件。')
