@@ -398,6 +398,15 @@ class Controller:
                 claimed = None  # 未完成订单的收款合计绝不可分摊到已确认子项。
                 if not pending:
                     reason = ''  # 原来整段解析报错，但分段已全部解释，不留错误提示。
+        # Opt-in fallback only after the original whole/partial chains found no bets.
+        if not bets and self.settings.get('recognition_outer_compat', False):
+            from recognition_outer_compat import recover
+            recovered = recover(parser, record.lottery, text)
+            if recovered is not None:
+                bets, normalized, reason, parser = recovered
+                claimed = parser.last_claimed
+                receipt_rows = list(parser.last_receipts)
+                pending = []
         if self._is_verified_total_note(text, pending, bets):
             claimed = sum(cents(b.principal) for b in bets) / 100
             pending = []
