@@ -399,7 +399,7 @@ class Controller:
                 if not pending:
                     reason = ''  # 原来整段解析报错，但分段已全部解释，不留错误提示。
         # Opt-in fallback only after the original whole/partial chains found no bets.
-        if not bets and self.settings.get('recognition_outer_compat', False):
+        if not bets and text == record.raw_text and self.settings.get('recognition_outer_compat', False):
             from recognition_outer_compat import recover
             recovered = recover(parser, record.lottery, text)
             if recovered is not None:
