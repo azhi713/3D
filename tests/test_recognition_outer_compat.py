@@ -52,7 +52,8 @@ class OuterCompatibility(unittest.TestCase):
                     self.assertEqual(rec.claimed_amount,5)
                     self.assertIsNone(rec.received_amount)
                     self.assertEqual(rec.parse_status,'verified_receipt_discrepancy')
-                    self.assertEqual(rec.raw_text,raw)
+                    self.assertEqual(rec.source_original_text,raw)
+                    self.assertEqual(rec.raw_text,raw.replace('，',','))  # existing routing normalization
                     ctrl.parse_record(rec)
                     self.assertEqual(len(rec.bets),1)
                     self.assertEqual(rec.bets[0].multiplier,1)
