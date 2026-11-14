@@ -74,7 +74,7 @@ class PerformanceGuards(unittest.TestCase):
             try:
                 c=Controller(store);c.activate_period('2026-11-15');c.settings['deadline']['enabled']=False
                 self.assertTrue(c.settings['recognition_outer_compat'])
-                raw='157、975、381、338、875\\n共5注直选 20 倍'
+                raw='157、975、381、338、875\n共5注直选 20 倍'
                 self.assertEqual(len(c.add('福彩',raw,period=c.period).bets),5)
                 c.settings['recognition_outer_compat']=False
                 self.assertFalse(c.add('福彩',raw,period=c.period).bets)
