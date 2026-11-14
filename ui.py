@@ -346,12 +346,21 @@ class RecordTable(tk.Frame):
             if y<=top:anchor=iid;offset=top-y
         counts={'insert':0,'update':0,'delete':0,'move':0}
         removed=[iid for iid in before if iid not in wanted]
+        recycle = os.environ.get('FC3D_RECORD_REUSE','0') == '1'
         if removed:
-            self.delete(*removed)
+            if recycle:
+                from record_row_reuse import retire
+                retire(self, removed)
+            else:
+                self.delete(*removed)
             counts['delete']=len(removed)
         for iid,values,tags in rows:
             iid=str(iid)
-            if iid not in self._rows:self.insert('','end',iid=iid,values=values,tags=tags);counts['insert']+=1
+            if iid not in self._rows:
+                from record_row_reuse import restore
+                if not recycle or not restore(self, iid, values, tags):
+                    self.insert('','end',iid=iid,values=values,tags=tags)
+                counts['insert']+=1
             elif self._rows[iid]['values']!=tuple(values) or self._rows[iid]['tags']!=tuple(tags):
                 self.update_row(iid,values,tags);counts['update']+=1
         if list(self._rows)!=desired:
