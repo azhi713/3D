@@ -124,6 +124,53 @@ class InboxRecovery(unittest.TestCase):
                     self.results.append(dict(case=phase,passed=True,result=a))
                 finally:ds.close()
 
+    def test_commit_io_failure_retries_without_partial_business_rows(self):
+        class FaultConnection(sqlite3.Connection):
+            fail_next_commit=False
+            def commit(self):
+                if self.fail_next_commit:
+                    self.fail_next_commit=False
+                    raise sqlite3.OperationalError('injected COMMIT I/O failure')
+                return super().commit()
+        connect=sqlite3.connect
+        with tempfile.TemporaryDirectory(prefix='p3-') as tmp, patch(
+                'sqlite3.connect',side_effect=lambda *a,**k:connect(*a,**dict(k,factory=FaultConnection))):
+            ds,c=open_app(tmp)
+            try:
+                WeChatService(ds.path,c.settings['wechat'])._persist(payload())
+                ds.db.fail_next_commit=True
+                self.assertTrue(c.drain_inbox()[1])
+                self.assertEqual(ds.db.execute('SELECT count(*) FROM records').fetchone()[0],0)
+                self.assertEqual(ds.db.execute('SELECT processed FROM inbox').fetchone()[0],0)
+                self.assertFalse(c.drain_inbox()[1])
+                a=snapshot(ds,c)
+                self.assertEqual([a['finance'][PERIOD][l]['income'] for l in ('福彩','体彩')],[1600,1600])
+                self.assertEqual(sum(x['action']=='添加原文' for x in a['audit']),2)
+                self.results.append(dict(case='actual_commit_failure',passed=True,result=a))
+            finally:ds.close()
+
+    def test_legacy_completed_sections_before_processed_marker(self):
+        for all_complete in (False,True):
+            with tempfile.TemporaryDirectory(prefix='p3-') as tmp:
+                ds,c=open_app(tmp)
+                try:
+                    if all_complete:
+                        c.add('福彩',RAW,source='微信',message_id='n1',group_id='g1@chatroom',period=PERIOD)
+                    else:
+                        rec=MessageRecord('福彩','微信',split_lottery_message(RAW,'福彩')['福彩'],
+                                          source_message_id='n1',group_id='g1@chatroom',period=PERIOD,
+                                          source_original_text=RAW)
+                        ds.insert(rec);c.parse_record(rec);ds.update(rec,'本地识别或待AI')
+                    WeChatService(ds.path,c.settings['wechat'])._persist(payload())
+                    self.assertFalse(c.drain_inbox()[1])
+                    a=snapshot(ds,c)
+                    self.assertEqual([a['finance'][PERIOD][l]['income'] for l in ('福彩','体彩')],[1600,1600])
+                    self.assertEqual(len(a['records']),2)
+                    self.assertEqual(sum(x['action']=='添加原文' for x in a['audit']),2)
+                    self.assertEqual(sum(x['action']=='本地识别或待AI' for x in a['audit']),2)
+                    self.results.append(dict(case='legacy_all_complete' if all_complete else 'legacy_first_complete',passed=True,result=a))
+                finally:ds.close()
+
     def test_legacy_pristine_partial_resumes_without_historical_reparse(self):
         with tempfile.TemporaryDirectory(prefix='p3-') as tmp:
             ds,c=open_app(tmp)
@@ -204,6 +251,8 @@ class InboxRecovery(unittest.TestCase):
                 for period in ('2026-11-14',PERIOD):
                     for lot in ('福彩','体彩'):self.assertEqual(a['finance'][period][lot]['income'],48000)
                 self.assertTrue(all(x[2]==1 for x in a['inbox']))
+                completed_ids=[x['payload']['inbox_id'] for x in a['audit'] if x['action']=='消息全部业务片段完成']
+                self.assertEqual(completed_ids,sorted(completed_ids))
                 self.results.append(dict(case='multigroup_concurrent_cross_date',passed=True,result=a))
             finally:ds.close()
 
