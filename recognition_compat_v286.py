@@ -158,6 +158,19 @@ def _counted_blocks(parser, lottery, original, text):
     if not saw_summary:
         return None
     if any(buffer):
+        # R1: only a trailing shared instruction left after validated counted
+        # blocks may defer to V282's complete-source evidence. Count failures
+        # above remain failures; never silently repair historical records.
+        import os
+        if os.environ.get('FC3D_SHARED_ORDER_FIX', '1') == '1':
+            from shared_orders_v282 import parse_shared_order
+            probe = type(parser)(parser.rules, parser.policy)
+            shared = parse_shared_order(probe, lottery, original)
+            if shared is not None and shared[0] and not shared[2]:
+                parser.last_claimed = probe.last_claimed
+                parser.last_receipts = probe.last_receipts
+                parser.last_warnings = probe.last_warnings
+                return shared
         return _fail(parser, original, '大底末尾有未关联注数的号码块')
     try:
         bets = []
