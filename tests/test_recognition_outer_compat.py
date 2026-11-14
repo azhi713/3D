@@ -57,3 +57,11 @@ class OuterCompatibility(unittest.TestCase):
                     self.assertEqual(len(rec.bets),1)
                     self.assertEqual(rec.bets[0].multiplier,1)
             finally:store.close()
+
+    def test_explicit_inline_list_keeps_duplicates_and_lottery(self):
+        for raw,codes,multiple in [('福101 102 103直3倍',['101','102','103'],3),
+                                   ('福001 001 005直选1倍',['001','001','005'],1)]:
+            bets,_,_,_=recover(BetParser(),'福彩',raw)
+            self.assertEqual([b.selection for b in bets],codes)
+            self.assertEqual([b.multiplier for b in bets],[multiple]*3)
+            self.assertIsNone(recover(BetParser(),'体彩',raw))

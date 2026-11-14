@@ -2,6 +2,11 @@
 import re
 from decimal import Decimal
 
+_INLINE = re.compile(
+    r'(?P<lot>福彩|体彩|福|体|排)?(?P<numbers>[0-9]{3}(?:[ 、,，]+[0-9]{3})+)'
+    r'(?:直选|直)(?P<multiple>[1-9][0-9]{0,3})倍'
+)
+
 _PATTERN = re.compile(
     r'[ \t]*(?P<numbers>[0-9]{3}(?:[ \t]*[、,，;； ][ \t]*[0-9]{3})+)[ \t]*\r?\n'
     r'[ \t]*共(?P<count>[1-9][0-9]{0,3})注直选[ \t]*(?P<multiple>[1-9][0-9]{0,3})[ \t]*倍[ \t]*'
@@ -13,9 +18,14 @@ def recover(parser, lottery, text):
         return None
     match = _PATTERN.fullmatch(text)
     if not match:
-        return recover_explicit_receipt(parser, lottery, text)
+        match = _INLINE.fullmatch(text)
+        if not match:
+            return recover_explicit_receipt(parser, lottery, text)
+        lot = match['lot']
+        if lot and ((lot in ('福','福彩')) != (lottery == '福彩')):
+            return None
     tokens = list(re.finditer(r'[0-9]{3}', match['numbers']))
-    if len(tokens) != int(match['count']):
+    if 'count' in match.re.groupindex and len(tokens) != int(match['count']):
         return None
     numbers = [t.group() for t in tokens]
     multiple = int(match['multiple'])
