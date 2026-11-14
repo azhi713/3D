@@ -1204,7 +1204,12 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self._switch_lottery_filter(self.lottery.get())
         self._sync_draw_context()
         lottery = self.lottery.get()
-        cache_key = (self.store.change_serial,self.controller.period,lottery)
+        from analysis_input_cache import enabled, records_version, prepare
+        input_cache_enabled = enabled()
+        record_version = records_version(self.store, self.controller.period) if input_cache_enabled else None
+        cache_key = ((record_version if record_version is not None else object()),
+                     self.controller.period, lottery) if input_cache_enabled else (
+                     self.store.change_serial, self.controller.period, lottery)
         if self._records_cache[0] != cache_key:
             records = [r for r in self.controller.records() if r.lottery == lottery]
             self._records_cache = (cache_key,records)
@@ -1239,14 +1244,18 @@ class RiskApp(ShortcutMixin, tk.Tk):
         self.records_summary.configure(text=f'今日{len(records)}条 · 已识别{recognized} · 待处理{len(records)-recognized} · AI排队{in_queue} · 处理中{active} · 已选{len(self.records_tree.selection())}')
         periods = self._visible_periods()
         self.period_combo.configure(values=periods)
-        inputs = self.controller.analysis_inputs(lottery,records)
+        if input_cache_enabled:
+            inputs, cached_signature = prepare(self, lottery, records, record_version)
+        else:
+            inputs = self.controller.analysis_inputs(lottery,records)
         # Income is a verified-record aggregate, independent of whether any
         # threshold/hedge-plan calculation later succeeds.
         self._current_revenue_cents = int(inputs[3])
         # Only financial inputs affect the 1000-outcome calculation; queue/status changes reuse it.
         # V277: changing external pricing invalidates optimizer candidates.
         cfg = self.controller.settings
-        signature = repr((self.controller.period,lottery,inputs,
+        signature = cached_signature if input_cache_enabled else repr((
+                         self.controller.period,lottery,inputs,
                          cfg['direct_unit_cost'][lottery],
                          cfg['external_direct_prize'][lottery],
                          cfg['external_leopard_direct_prize'][lottery]))
