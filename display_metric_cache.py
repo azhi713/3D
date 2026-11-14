@@ -8,7 +8,7 @@ def cached_metrics(function):
     @functools.wraps(function)
     def wrapped(revenue_cents,payouts_cents,purchase):
         nonlocal latest
-        if os.environ.get('FC3D_DISPLAY_CACHE','0')!='1':
+        if os.environ.get('FC3D_DISPLAY_CACHE','1')!='1':
             return function(revenue_cents,payouts_cents,purchase)
         try:
             key=json.dumps([revenue_cents,payouts_cents,purchase],sort_keys=True,ensure_ascii=False,allow_nan=False)

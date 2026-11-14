@@ -346,7 +346,7 @@ class RecordTable(tk.Frame):
             if y<=top:anchor=iid;offset=top-y
         counts={'insert':0,'update':0,'delete':0,'move':0}
         removed=[iid for iid in before if iid not in wanted]
-        recycle = os.environ.get('FC3D_RECORD_REUSE','0') == '1'
+        recycle = os.environ.get('FC3D_RECORD_REUSE','1') == '1'
         if removed:
             if recycle:
                 from record_row_reuse import retire

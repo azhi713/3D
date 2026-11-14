@@ -15,7 +15,7 @@ def database_token(store):
         return None
 
 def preview(controller, lottery, draw, period, compute):
-    if os.environ.get('FC3D_PREVIEW_CACHE','0')!='1':
+    if os.environ.get('FC3D_PREVIEW_CACHE','1')!='1':
         return compute()
     def key():
         token=database_token(controller.store)

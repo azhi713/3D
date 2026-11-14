@@ -25,6 +25,7 @@ class OuterCompatibility(unittest.TestCase):
                 ctrl=Controller(store);ctrl.activate_period('2026-11-15')
                 ctrl.settings['deadline']['enabled']=False
                 raw='157、975、381、338、875\n共5注直选 20 倍'
+                ctrl.settings['recognition_outer_compat']=False
                 before=ctrl.add('福彩',raw)
                 self.assertFalse(before.bets)
                 ctrl.settings['recognition_outer_compat']=True

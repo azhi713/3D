@@ -4,7 +4,7 @@ import os
 from preview_cache import database_token
 
 def enabled():
-    return os.environ.get('FC3D_INPUT_CACHE','0')=='1'
+    return os.environ.get('FC3D_INPUT_CACHE','1')=='1'
 
 def records_version(store, period):
     token=database_token(store)

@@ -325,6 +325,7 @@ RULES_BY_LOTTERY = {
 }
 
 DEFAULT_SETTINGS = {
+    'recognition_outer_compat': True,
     "risk_threshold": 5000,
     "threshold_metric": "payout",
     "policy": {"position_cost": "combination", "span0_wins": True},
