@@ -817,7 +817,14 @@ class Controller:
                     results.append(final_snapshot)
         return results
 
-    def preview_draw(self, lottery, draw, period=None):
+    def preview_draw(self, lottery, draw, period=None, *, reuse=False):
+        if reuse:
+            from preview_cache import preview
+            return preview(self, lottery, draw, period or self.period,
+                           lambda: self._preview_draw_uncached(lottery, draw, period))
+        return self._preview_draw_uncached(lottery, draw, period)
+
+    def _preview_draw_uncached(self, lottery, draw, period=None):
         """不入库的实际开奖试算；只汇总已验证子项，不能把疑难投注当作零。"""
         period = period or self.period
         if lottery not in LOTTERIES or not isinstance(draw, str) or not re.fullmatch(r'[0-9]{3}', draw):

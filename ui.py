@@ -1819,7 +1819,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
             return
         try:
             self._draw_preview = self.controller.preview_draw(
-                self.lottery.get(), number, self.controller.period)
+                self.lottery.get(), number, self.controller.period, reuse=True)
         except (ValueError, KeyError) as exc:
             self._draw_preview = None
             self.draw_summary_label.configure(text='模拟试算失败：' + str(exc), foreground=RED)
@@ -2045,7 +2045,7 @@ class RiskApp(ShortcutMixin, tk.Tk):
             return
         try:
             preview = self.controller.preview_draw(
-                self.lottery.get(), number, self.controller.period)
+                self.lottery.get(), number, self.controller.period, reuse=silent)
         except (ValueError, KeyError) as exc:
             self._draw_preview = None
             self._update_financial_cards()
