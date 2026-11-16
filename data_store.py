@@ -3,7 +3,7 @@ import json
 import hashlib
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from copy import deepcopy
 from pathlib import Path
 from config import DEFAULT_SETTINGS, DEFAULT_AI_PROMPT, LOTTERIES
@@ -57,21 +57,75 @@ class DataStore:
         self.import_errors = []
         self.credential_error = ''
         self.change_serial=0
+        self._transaction_sequence=0
+
+    @contextmanager
+    def transaction(self):
+        """Real nested transactions: inner store methods never commit an owner."""
+        self._transaction_sequence += 1
+        name = 'store_' + str(self._transaction_sequence)
+        owner = not self.db.in_transaction
+        self.db.execute('BEGIN IMMEDIATE' if owner else 'SAVEPOINT ' + name)
+        try:
+            yield
+            if owner:
+                self.db.commit()
+            else:
+                self.db.execute('RELEASE SAVEPOINT ' + name)
+        except BaseException:
+            if owner:
+                self.db.rollback()
+            else:
+                self.db.execute('ROLLBACK TO SAVEPOINT ' + name)
+                self.db.execute('RELEASE SAVEPOINT ' + name)
+            self.change_serial += 1
+            raise
+
+    def inbox_record(self, lottery, source, native_id, group_id, source_key):
+        rows = self.db.execute(
+            'SELECT payload,deleted FROM records WHERE lottery=? AND source=? AND source_id IN (?,?)',
+            (lottery,source,native_id,source_key)).fetchall()
+        for payload,deleted in rows:
+            record = MessageRecord.from_dict(json.loads(payload))
+            if record.group_id == group_id and record.source_message_id == native_id:
+                if deleted or record.revision != 0:
+                    raise ValueError('待处理消息已有人工修改或软删除；保留原账，需单独核对')
+                return record
+        return None
+
+    def complete_inbox(self, inbox_id, records):
+        """Called inside the message transaction, after every business section."""
+        if not self.db.in_transaction:
+            raise RuntimeError('消息完成标记必须与业务写入在同一事务')
+        row = self.db.execute('SELECT payload FROM inbox WHERE id=? AND processed=0',(inbox_id,)).fetchone()
+        if row is None:
+            raise ValueError('收件状态已改变')
+        payload = json.loads(row[0])
+        payload['processing_v3'] = {
+            'state':'business_complete', 'record_ids':[r.record_id for r in records],
+            'sections':[{'lottery':r.lottery,'raw_text':r.raw_text} for r in records]}
+        self.db.execute('UPDATE inbox SET payload=? WHERE id=?',
+                        (json.dumps(payload,ensure_ascii=False),inbox_id))
+        self._audit('消息全部业务片段完成', {
+            'inbox_id':inbox_id,'native_id':payload['message_id'],
+            'group_id':payload['group_id'],'record_ids':[r.record_id for r in records]})
+        self.mark_inbox_processed(inbox_id)
 
     def _audit(self, action, obj):
         self.db.execute('INSERT INTO audit(timestamp,action,payload) VALUES(?,?,?)',
                         (now().isoformat(), action, json.dumps(obj, ensure_ascii=False)))
 
-    def insert(self, record):
+    def insert(self, record, *, source_key=None):
         if not record.source_original_text:
             record.source_original_text = record.raw_text
-        with self.db:
+        key = source_key or record.source_message_id
+        with self.transaction():
             try:
                 self.db.execute('INSERT INTO records(id,period,lottery,source_id,source,payload) VALUES(?,?,?,?,?,?)',
-                                (record.record_id, record.period, record.lottery, record.source_message_id or None,
+                                (record.record_id, record.period, record.lottery, key or None,
                                  record.source, json.dumps(record.to_dict(), ensure_ascii=False)))
             except sqlite3.IntegrityError:
-                if record.source_message_id and self.find_source(record.lottery, record.source, record.source_message_id):
+                if record.source_message_id and self.find_source(record.lottery, record.source, key):
                     return False
                 raise
             self._audit('添加原文', record.to_dict())
@@ -79,7 +133,7 @@ class DataStore:
         return True
 
     def update(self, record, action='更新', expected_revision=None):
-        with self.db:
+        with self.transaction():
             old = self.db.execute('SELECT payload FROM records WHERE id=? AND deleted=0',
                                   (record.record_id,)).fetchone()
             if not old:
@@ -112,7 +166,7 @@ class DataStore:
         if not ids:
             return 0
         deleted = 0
-        with self.db:
+        with self.transaction():
             for record_id in ids:
                 row = self.db.execute(
                     'SELECT payload FROM records WHERE id=? AND deleted=0', (record_id,)
@@ -153,7 +207,7 @@ class DataStore:
                 obj = json.loads(path.read_text(encoding='utf-8-sig'))
                 if not isinstance(obj.get('records'), list):
                     raise ValueError('缺少records数组')
-                with self.db:
+                with self.transaction():
                     for old in obj['records']:
                         record = MessageRecord.from_dict(old)
                         if record.lottery not in LOTTERIES:
@@ -221,7 +275,7 @@ class DataStore:
         if key:
             ai['api_key_encrypted'] = protect_key(key)
         clean.get('wechat', {}).pop('bridge_token', None)
-        with self.db:
+        with self.transaction():
             self.db.execute('INSERT OR REPLACE INTO settings(id,payload) VALUES(1,?)',
                             (json.dumps(clean, ensure_ascii=False),))
 
@@ -229,7 +283,7 @@ class DataStore:
         self.db.close()
 
     def save_period_rules(self, period, rules, policy):
-        with self.db:
+        with self.transaction():
             self.db.execute('INSERT OR REPLACE INTO period_rules(period,payload) VALUES(?,?)',
                             (period, json.dumps({'rules': rules, 'policy': policy}, ensure_ascii=False)))
 
@@ -248,7 +302,7 @@ class DataStore:
 
     def freeze_batch(self, period, lottery, snapshot, timestamp):
         """冻结快照只写一次，避免之后的AI/人工修改覆盖截止时的数据。"""
-        with self.db:
+        with self.transaction():
             changed = self.db.execute(
                 'INSERT OR IGNORE INTO batch_snapshots'
                 '(period,lottery,state,frozen_at,frozen_payload) VALUES(?,?,?,?,?)',
@@ -260,7 +314,7 @@ class DataStore:
 
     def finalize_batch(self, period, lottery, summary, timestamp):
         """截止快照独立保存；最终统计也只允许第一次成功写入。"""
-        with self.db:
+        with self.transaction():
             changed = self.db.execute(
                 'UPDATE batch_snapshots SET state=?,finalized_at=?,final_payload=?'
                 ' WHERE period=? AND lottery=? AND state=?',
@@ -283,7 +337,7 @@ class DataStore:
         """独立于下注记录、首次写入后不可覆盖的兑奖账本。"""
         if not re.fullmatch(r'[0-9]{3}', draw):
             raise ValueError('开奖号码必须为三位数字，000也有效')
-        with self.db:
+        with self.transaction():
             existing = self.db.execute(
                 'SELECT draw FROM settlements WHERE period=? AND lottery=?',
                 (period,lottery)).fetchone()
@@ -325,12 +379,12 @@ class DataStore:
         return [(row[0], row[0]) for row in self.db.execute('SELECT DISTINCT group_id FROM inbox')]
 
     def mark_inbox_processed(self, inbox_id):
-        with self.db:
+        with self.transaction():
             self.db.execute('UPDATE inbox SET processed=1 WHERE id=?', (inbox_id,))
 
     def mark_inbox_rejected(self, inbox_id, reason):
         """逾期收件仍保留原payload和审计证据，不默默删掉原文。"""
-        with self.db:
+        with self.transaction():
             self.db.execute('UPDATE inbox SET processed=2 WHERE id=? AND processed=0', (inbox_id,))
             self._audit('截止后拒收收件箱消息', {'inbox_id':inbox_id,'reason':reason})
 

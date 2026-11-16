@@ -1,3 +1,4 @@
+import sqlite3
 from copy import deepcopy
 from collections import Counter
 import hashlib
@@ -556,7 +557,7 @@ class Controller:
                 record.note += '；尾数含义未核对，投注暂不计入风险'
         self._annotate_bets(record, parser)
 
-    def add(self, lottery, text, source='人工', message_id='', sender='', group_id='', created_at=None, period=None):
+    def add(self, lottery, text, source='人工', message_id='', sender='', group_id='', created_at=None, period=None, *, source_key=None, resume_inbox=False):
         if lottery not in LOTTERIES or not isinstance(text, str) or not text.strip():
             raise ValueError('请选择彩种并输入投注文字')
         record_period = period or self.period
@@ -582,8 +583,24 @@ class Controller:
                                    engine_version=ENGINE_VERSION)
             if created_at:
                 record.created_at = created_at
-            # 先事务提交原文，解析或AI失败仍可恢复。
-            if not self.store.insert(record):
+            # inbox itself is already durable; the caller owns one transaction
+            # for every routed section, source audit and completion marker.
+            existing = (self.store.inbox_record(target_lottery,source,message_id,group_id,source_key)
+                        if resume_inbox else None)
+            if existing is not None:
+                if existing.raw_text != section_text or existing.source_original_text != text:
+                    raise ValueError('待处理消息原文与已有记录不一致；保留原账，需单独核对')
+                record = existing
+                pristine = (not record.bets and not record.note and
+                            record.parse_status == 'needs_review' and record.received_amount is None
+                            and not record.ai_candidate and not record.ai_history)
+                if not pristine:
+                    if not (record.note or record.bets or record.parse_status != 'needs_review'):
+                        raise ValueError('已有原文缺少业务完成证据；保留原账，需单独核对')
+                    self.last_added_records.append(record)
+                    continue
+            elif not (self.store.insert(record, source_key=source_key) if source_key
+                      else self.store.insert(record)):
                 continue
             try:
                 self.parse_record(record)
@@ -593,7 +610,7 @@ class Controller:
                 record.status = '待确认'
                 record.parse_status = 'needs_review'
                 record.note = '本地识别异常，原始消息已保存：' + str(exc)[:200]
-            self.store.update(record, '本地识别或待AI')
+            self.store.update(record, '本地识别或待AI', expected_revision=record.revision)
             self.last_added_records.append(record)
         from routing_v260 import shared_total
         common_total = shared_total(text, lottery)
@@ -603,6 +620,8 @@ class Controller:
             due = sum(cents(b.principal) for x in parts for b in x.bets)
             equal = due == cents(common_total)
             for x in parts:
+                if resume_inbox and '双彩共同合计' in x.note:
+                    continue  # legacy pending inbox may already have this audit
                 x.note += ('；双彩共同合计已核对' if complete and equal else
                            '；双彩共同合计有差异，须按原文投注证据核对' if complete else
                            '；原文包含双彩共同合计，另一个彩种尚未完全识别')
@@ -1047,18 +1066,29 @@ class Controller:
                 # 未绑定群保留，用户绑定后仍可接着处理。
                 continue
             try:
+                import hashlib
+                import json
                 source = '微信历史' if payload.get('history') else '微信'
-                record = self.add(lottery, payload['text'], source=source, message_id=payload['message_id'],
-                                  sender=payload.get('sender', ''), group_id=payload['group_id'],
-                                  created_at=payload.get('received_at'), period=payload['period'])
-                self.store.mark_inbox_processed(inbox_id)
-                if record:
+                source_key = 'inbox-v3:' + hashlib.sha256(json.dumps(
+                    [payload['group_id'],payload['message_id']],ensure_ascii=False).encode()).hexdigest()
+                with self.store.transaction():
+                    current = self.store.db.execute(
+                        'SELECT processed FROM inbox WHERE id=?',(inbox_id,)).fetchone()
+                    if current is None or current[0] != 0:
+                        continue
+                    self.add(lottery, payload['text'], source=source, message_id=payload['message_id'],
+                             sender=payload.get('sender', ''), group_id=payload['group_id'],
+                             created_at=payload.get('received_at'), period=payload['period'],
+                             source_key=source_key, resume_inbox=True)
                     from wechat_text_v281 import annotate_received
                     for received_record in self.last_added_records:
                         if annotate_received(received_record, payload):
-                            self.store.update(received_record, '微信发送人前缀与投注正文分离')
-                    added.extend(self.last_added_records)
-            except (ValueError, OSError) as exc:
+                            self.store.update(received_record, '微信发送人前缀与投注正文分离',
+                                              expected_revision=received_record.revision)
+                    self.store.complete_inbox(inbox_id,self.last_added_records)
+                added.extend(self.last_added_records)  # publish only after COMMIT
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.last_added_records = []
                 if '21:14已截止' in str(exc):
                     self.store.mark_inbox_rejected(inbox_id, str(exc))
                 errors.append(str(exc))
